@@ -1,0 +1,7 @@
+[
+  "test_alphasimpy.py::test_basic_functionality",
+  "test_alphasimpy.py::test_map_pop_validation",
+  "test_alphasimpy.py::test_newpop_functionality",
+  "test_alphasimpy.py::test_parameter_validation",
+  "test_alphasimpy.py::test_threading"
+]
