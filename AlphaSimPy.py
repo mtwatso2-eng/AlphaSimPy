@@ -6,13 +6,13 @@ import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-# Try to import C++ bindings, fall back to Python implementation if not available
+# Try to import C++ bindings, throw import error if not available
 try:
     import _alphasimpy_cpp
     _USE_CPP = True
 except ImportError:
     _USE_CPP = False
-    print("Warning: C++ bindings not available. Using Python implementation.")
+    print("Error: C++ bindings not available.")
     # Thread-local random number generator
     _thread_local = threading.local()
 
