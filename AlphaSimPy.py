@@ -34,6 +34,7 @@ class MapPop:
     gen_map: List[np.ndarray]
     centromere: List[float]
     inbred: bool
+    gen_map_names: Optional[List[np.ndarray]] = None  # Marker names per chromosome
     
     def __post_init__(self):
         """Validate the MapPop object"""
@@ -77,6 +78,79 @@ def sample_int(n: int, N: int) -> np.ndarray:
     
     # Use numpy's random choice for efficiency
     return np.random.choice(N, size=n, replace=False).astype(np.uint32)
+
+
+def _trans_mat(R: np.ndarray) -> np.ndarray:
+    """
+    Compute transformation matrix for correlated random normals.
+    From AlphaSimR misc.R transMat - eigendecomposition for positive semi-definite check.
+    """
+    if not np.allclose(R, R.T):
+        raise ValueError("Matrix is not symmetric")
+    eig_vals, eig_vecs = np.linalg.eigh(R)
+    eps = np.finfo(float).eps
+    if np.min(eig_vals) < eps:
+        import warnings
+        warnings.warn("Matrix is not positive semi-definite, see ?transMat for details")
+        eig_vals = np.maximum(eig_vals, 100 * eps)
+        m = R.shape[0]
+        tot_var = np.sum(eig_vals)
+        eig_vals = eig_vals * m / tot_var
+        new_R = eig_vecs @ np.diag(eig_vals) @ eig_vecs.T
+        new_R = new_R / np.sqrt(np.outer(np.diag(new_R), np.diag(new_R)))
+        eig_vals, eig_vecs = np.linalg.eigh(new_R)
+    return (eig_vecs * np.sqrt(np.maximum(eig_vals, 0))) @ eig_vecs.T
+
+
+def add_error(gv: np.ndarray, var_e: Union[np.ndarray, List[float]], reps: int = 1) -> np.ndarray:
+    """
+    Add residual error to genetic values.
+    From AlphaSimR phenotypes.R addError.
+    
+    Parameters:
+    -----------
+    gv : numpy.ndarray
+        Matrix of genetic values (n_ind x n_traits)
+    var_e : numpy.ndarray or list
+        Residual variances - vector (diagonal) or full covariance matrix
+    reps : int, default=1
+        Number of replications for phenotype (scales variance by 1/reps)
+    
+    Returns:
+    --------
+    numpy.ndarray
+        Phenotype matrix (gv + error)
+    """
+    gv = np.asarray(gv)
+    n_traits = gv.shape[1]
+    n_ind = gv.shape[0]
+    
+    if isinstance(var_e, np.ndarray) and var_e.ndim == 2:
+        if not np.allclose(var_e, var_e.T):
+            raise ValueError("Covariance matrix must be symmetric")
+        if var_e.shape[0] != n_traits:
+            raise ValueError("Covariance matrix dimension must match n_traits")
+        error = np.random.standard_normal((n_ind, n_traits)) @ _trans_mat(var_e)
+    else:
+        var_e = np.atleast_1d(var_e)
+        if len(var_e) != n_traits:
+            raise ValueError("var_e length must match n_traits")
+        error_list = []
+        for v in var_e:
+            if np.isnan(v):
+                error_list.append(np.full(n_ind, np.nan))
+            else:
+                error_list.append(np.random.normal(0, np.sqrt(float(v)), n_ind))
+        error = np.column_stack(error_list)
+    
+    error = error / np.sqrt(reps)
+    return gv + error
+
+
+def addError(gv, varE=None, reps=1, var_e=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    ve = varE if var_e is None else var_e
+    return add_error(gv, ve, reps)
 
 
 # Removed simulate_chromosome - now using C++ implementation via macs_wrapper
@@ -223,8 +297,6 @@ def run_macs(n_ind: int,
     if _USE_CPP:
         # Convert seg_sites to numpy array
         max_sites_array = np.array(seg_sites, dtype=np.uint32)
-
-        print(command)
         
         # Call C++ MaCS function
         result = _alphasimpy_cpp.macs(
@@ -281,6 +353,359 @@ def run_macs(n_ind: int,
     return output
 
 
+def _pack_haplo(haplo: np.ndarray, ploidy: int, inbred: bool) -> np.ndarray:
+    """
+    Pack haplotype matrix into binary format. Matches AlphaSimR packHaplo.cpp logic.
+    haplo: (n_haplo, n_loci) matrix of 0/1
+    Returns: (n_bins, ploidy, n_ind) uint8 array
+    """
+    haplo = np.asarray(haplo, dtype=np.uint8)
+    n_hap, n_loci = haplo.shape
+    if inbred:
+        n_ind = n_hap
+    else:
+        if n_hap % ploidy != 0:
+            raise ValueError("Number of rows not a factor of ploidy")
+        n_ind = n_hap // ploidy
+    n_bins = n_loci // 8 + (1 if n_loci % 8 else 0)
+    output = np.zeros((n_bins, ploidy, n_ind), dtype=np.uint8)
+    for i in range(n_hap):
+        locus = 0
+        for j in range(n_bins):
+            byte_val = 0
+            for k in range(8):
+                if locus < n_loci:
+                    byte_val |= (int(haplo[i, locus]) << k)
+                    locus += 1
+            if inbred:
+                for chr_idx in range(ploidy):
+                    output[j, chr_idx, i] = byte_val
+            else:
+                chr_idx = i % ploidy
+                ind_idx = i // ploidy
+                output[j, chr_idx, ind_idx] = byte_val
+    return output
+
+
+def new_map_pop(gen_map: List[np.ndarray], haplotypes: List[np.ndarray],
+                inbred: bool = False, ploidy: int = 2) -> MapPop:
+    """
+    Create MapPop from genetic map and haplotypes. From AlphaSimR founderPop.R newMapPop.
+    """
+    ploidy = int(ploidy)
+    if len(gen_map) != len(haplotypes):
+        raise ValueError("genMap and haplotypes must have same length")
+    n_row = [h.shape[0] for h in haplotypes]
+    if len(set(n_row)) > 1:
+        raise ValueError("Number of rows must be equal in haplotypes")
+    n_row = n_row[0]
+    if inbred:
+        n_ind = n_row
+    else:
+        if n_row % ploidy != 0:
+            raise ValueError("Number of haplotypes must be divisible by ploidy")
+        n_ind = n_row // ploidy
+    seg_sites = [len(g) for g in gen_map]
+    n_col = [h.shape[1] for h in haplotypes]
+    if not all(nc == seg_sites[i] for i, nc in enumerate(n_col)):
+        raise ValueError("Number of segregating sites in haplotypes and genMap don't match")
+    geno_list = []
+    for chr_idx in range(len(gen_map)):
+        packed = _pack_haplo(haplotypes[chr_idx], ploidy, inbred)
+        geno_list.append(packed)
+    centromere = [np.max(g) / 2 for g in gen_map]
+    return MapPop(
+        n_ind=n_ind, n_chr=len(gen_map), ploidy=ploidy,
+        n_loci=seg_sites, geno=geno_list, gen_map=gen_map,
+        centromere=centromere, inbred=inbred
+    )
+
+
+def newMapPop(genMap, haplotypes, inbred=False, ploidy=2):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return new_map_pop(genMap, haplotypes, inbred, ploidy)
+
+
+def quick_haplo(n_ind: int, n_chr: int, seg_sites: Union[int, List[int]],
+                gen_len: Union[float, List[float]] = 1, ploidy: int = 2,
+                inbred: bool = False) -> MapPop:
+    """
+    Quick founder haplotype simulation - random 0/1 sampling.
+    From AlphaSimR founderPop.R quickHaplo.
+    """
+    ploidy = int(ploidy)
+    n_ind = int(n_ind)
+    n_chr = int(n_chr)
+    seg_sites = [int(seg_sites)] * n_chr if np.isscalar(seg_sites) else [int(s) for s in seg_sites]
+    gen_len = [float(gen_len)] * n_chr if np.isscalar(gen_len) else [float(g) for g in gen_len]
+    n_bins = [s // 8 + (1 if s % 8 else 0) for s in seg_sites]
+    centromere = [g / 2 for g in gen_len]
+    geno_list = []
+    gen_map_list = []
+    for i in range(n_chr):
+        gen_map_list.append(np.linspace(0, gen_len[i], seg_sites[i]))
+        raw_geno = np.random.randint(0, 256, size=(n_ind * ploidy * n_bins[i]), dtype=np.uint8)
+        geno_arr = raw_geno.reshape(n_bins[i], ploidy, n_ind)
+        if inbred and ploidy > 1:
+            for j in range(1, ploidy):
+                geno_arr[:, j, :] = geno_arr[:, 0, :]
+        geno_list.append(geno_arr)
+    return MapPop(
+        n_ind=n_ind, n_chr=n_chr, ploidy=ploidy,
+        n_loci=seg_sites, geno=geno_list, gen_map=gen_map_list,
+        centromere=centromere, inbred=inbred
+    )
+
+
+def quickHaplo(nInd, nChr, segSites, genLen=1, ploidy=2, inbred=False):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return quick_haplo(nInd, nChr, segSites, genLen, ploidy, inbred)
+
+
+def import_gen_map(gen_map) -> tuple:
+    """
+    Format genetic map from DataFrame to (positions_dict, names_dict).
+    From AlphaSimR importData.R importGenMap.
+    gen_map: DataFrame with columns markerName, chromosome, position
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ImportError("pandas required for importGenMap")
+    if isinstance(gen_map, pd.DataFrame):
+        marker_name = gen_map.iloc[:, 0].astype(str).values
+        chromosome = gen_map.iloc[:, 1].astype(str).values
+        position = gen_map.iloc[:, 2].astype(float).values
+    else:
+        arr = np.asarray(gen_map)
+        marker_name = arr[:, 0].astype(str)
+        chromosome = arr[:, 1].astype(str)
+        position = arr[:, 2].astype(float)
+    unique_chr = np.unique(chromosome)
+    gen_map_pos = {}
+    gen_map_names = {}
+    for ch in unique_chr:
+        take = chromosome == ch
+        pos = position[take].copy()
+        names = marker_name[take].copy()
+        order = np.argsort(pos)
+        pos = pos[order]
+        names = names[order]
+        pos = pos - pos[0]
+        gen_map_pos[str(ch)] = pos
+        gen_map_names[str(ch)] = names
+    return gen_map_pos, gen_map_names
+
+
+def import_haplo(haplo, gen_map, ploidy: int = 2, ped=None) -> MapPop:
+    """
+    Import haplotypes from matrix format. From AlphaSimR importData.R importHaplo.
+    """
+    gen_map_pos, gen_map_names = import_gen_map(gen_map)
+    haplo = np.asarray(haplo)
+    if haplo.ndim == 1:
+        haplo = haplo.reshape(1, -1)
+    haplo = haplo.astype(np.uint8)
+    if not np.all((haplo == 0) | (haplo == 1)):
+        raise ValueError("Haplo must contain only 0 and 1")
+    if isinstance(gen_map, np.ndarray):
+        all_marker_names = gen_map[:, 0].astype(str)
+    else:
+        try:
+            import pandas as pd
+            all_marker_names = gen_map.iloc[:, 0].astype(str).values
+        except Exception:
+            all_marker_names = np.asarray(gen_map)[:, 0].astype(str)
+    chr_names = sorted(gen_map_pos.keys(), key=lambda x: (int(x) if str(x).isdigit() else x))
+    haplotypes = []
+    gen_map_arrays = []
+    names_arrays = []
+    for ch in chr_names:
+        map_markers = gen_map_names[ch]
+        pos_arr = gen_map_pos[ch]
+        take = []
+        valid_pos = []
+        valid_names = []
+        for i, m in enumerate(map_markers):
+            idx = np.where(all_marker_names == m)[0]
+            if len(idx) > 0:
+                take.append(idx[0])
+                valid_pos.append(pos_arr[i])
+                valid_names.append(m)
+        if len(take) < 1:
+            raise ValueError("No matching markers found for chromosome")
+        haplotypes.append(haplo[:, take])
+        gen_map_arrays.append(np.asarray(valid_pos))
+        names_arrays.append(np.array(valid_names))
+    founder = new_map_pop(gen_map_arrays, haplotypes, ploidy=ploidy)
+    founder.gen_map_names = names_arrays
+    return founder
+
+
+def importHaplo(haplo, genMap, ploidy=2, ped=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return import_haplo(haplo, genMap, ploidy, ped)
+
+
+def edit_genome(pop, ind, chr, seg_sites, allele, sim_param=None) -> 'Pop':
+    """
+    Edit genome at specific locus. From AlphaSimR misc.R editGenome.
+    Sets the specified allele at the given segregating site for the given individual(s).
+    """
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    ind = np.unique(np.atleast_1d(ind).astype(int))
+    if all(1 <= i <= pop.n_ind for i in ind):
+        ind = ind - 1
+    elif all(0 <= i < pop.n_ind for i in ind):
+        ind = ind
+    else:
+        raise ValueError("Invalid individual index")
+    chr = np.atleast_1d(chr).astype(int)
+    seg_sites = np.atleast_1d(seg_sites).astype(int)
+    if len(chr) != len(seg_sites):
+        raise ValueError("chr and segSites must have same length")
+    allele = np.atleast_1d(allele).astype(int)
+    if not np.all((allele == 0) | (allele == 1)):
+        raise ValueError("allele must be 0 or 1")
+    if len(allele) == 1:
+        allele = np.repeat(allele, len(seg_sites))
+    if len(allele) != len(seg_sites):
+        raise ValueError("allele length must match segSites")
+    allele = allele.astype(np.uint8)
+    for sel_chr in np.unique(chr):
+        sel = np.where(chr == sel_chr)[0]
+        for i in sel:
+            byte_idx = (seg_sites[i] - 1) // 8
+            bit_idx = (seg_sites[i] - 1) % 8
+            for sel_ind in ind:
+                idx = sel_ind
+                for j in range(pop.ploidy):
+                    old_byte = pop.geno[sel_chr - 1][byte_idx, j, idx]
+                    bits = [(old_byte >> k) & 1 for k in range(8)]
+                    bits[bit_idx] = allele[i]
+                    new_byte = sum(b << k for k, b in enumerate(bits))
+                    pop.geno[sel_chr - 1][byte_idx, j, idx] = new_byte
+    gv_new = _get_gv_index(pop, sim_param)
+    pop.gv = gv_new
+    pop.pheno = gv_new.copy()
+    return pop
+
+
+def editGenome(pop, ind, chr, segSites, allele, simParam=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    sp = simParam or sim_param
+    return edit_genome(pop, ind, chr, segSites, allele, sp)
+
+
+def new_empty_pop(ploidy: int = 2, sim_param=None) -> 'Pop':
+    """Create empty population. From AlphaSimR Class-Pop.R newEmptyPop."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    n_loci = sim_param.founder_pop.n_loci
+    geno = []
+    for i in range(sim_param.n_chr):
+        n_bins = n_loci[i] // 8 + (1 if n_loci[i] % 8 else 0)
+        geno.append(np.zeros((n_bins, ploidy, 0), dtype=np.uint8))
+    return Pop(
+        n_ind=0, n_chr=sim_param.n_chr, ploidy=ploidy, n_loci=n_loci,
+        geno=geno, gen_map=sim_param.founder_pop.gen_map,
+        centromere=sim_param.founder_pop.centromere, inbred=False,
+        id=[], iid=[], mother=[], father=[], sex=[],
+        n_traits=sim_param.n_traits,
+        gv=np.empty((0, sim_param.n_traits)), pheno=np.empty((0, sim_param.n_traits)),
+        ebv=np.empty((0, 0)), gxe=[None] * sim_param.n_traits,
+        fix_eff=[], misc={}, misc_pop={}
+    )
+
+
+def newEmptyPop(ploidy=2, simParam=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return new_empty_pop(ploidy, simParam)
+
+
+@dataclass
+class MultiPop:
+    """Container for multiple Pop objects. From AlphaSimR MultiPop."""
+    pops: List['Pop']
+    
+    def __len__(self):
+        return len(self.pops)
+    
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return MultiPop(pops=self.pops[i])
+        return self.pops[i]
+
+
+def new_multi_pop(*pops) -> MultiPop:
+    """Create MultiPop from one or more Pop objects. From AlphaSimR newMultiPop."""
+    input_list = list(pops)
+    for p in input_list:
+        if not isinstance(p, (Pop, MultiPop)):
+            raise ValueError("All arguments must be Pop or MultiPop")
+    flat = []
+    for p in input_list:
+        if isinstance(p, MultiPop):
+            flat.extend(p.pops)
+        else:
+            flat.append(p)
+    return MultiPop(pops=flat)
+
+
+def newMultiPop(*pops):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return new_multi_pop(*pops)
+
+
+def _pull_geno_from_packed(geno_list: List[np.ndarray], n_loci: List[int],
+                           ploidy: int, loci_per_chr: List[np.ndarray]) -> np.ndarray:
+    """Extract genotype matrix from packed format for specified loci."""
+    all_geno = []
+    for chr_idx, loci in enumerate(loci_per_chr):
+        if len(loci) == 0:
+            continue
+        geno = geno_list[chr_idx]
+        n_ind = geno.shape[2]
+        for loc in loci:
+            byte_idx = loc // 8
+            bit_idx = loc % 8
+            dosage = np.zeros(n_ind, dtype=int)
+            for p in range(ploidy):
+                byte_val = geno[byte_idx, p, :]
+                dosage += (byte_val >> bit_idx) & 1
+            all_geno.append(dosage)
+    return np.column_stack(all_geno) if all_geno else np.empty((geno_list[0].shape[2], 0))
+
+
+def pull_seg_site_geno(pop, chr=None, as_raw: bool = False,
+                       sim_param=None) -> np.ndarray:
+    """Pull segregating site genotypes. From AlphaSimR pullGeno.R pullSegSiteGeno."""
+    if hasattr(pop, 'geno'):
+        n_loci = list(pop.n_loci)
+        geno = pop.geno
+        ploidy = pop.ploidy
+    else:
+        if sim_param is None:
+            raise ValueError("simParam must be provided for MapPop")
+        n_loci = list(sim_param._seg_sites)
+        geno = pop.geno
+        ploidy = pop.ploidy
+    if chr is not None:
+        chr_idx = np.atleast_1d(chr) - 1
+        geno = [geno[i] for i in chr_idx if 0 <= i < len(geno)]
+        n_loci = [n_loci[i] for i in chr_idx if 0 <= i < len(n_loci)]
+    loci_per_chr = [np.arange(n) for n in n_loci]
+    result = _pull_geno_from_packed(geno, n_loci, ploidy, loci_per_chr)
+    return result
+
+
+def pullSegSiteGeno(pop, chr=None, asRaw=False, simParam=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    sp = simParam or sim_param
+    return pull_seg_site_geno(pop, chr, asRaw, sp)
+
+
 # Convenience function with the same name as AlphaSimR
 def runMacs(nInd, nChr=1, segSites=None, inbred=False, species="GENERIC",
             split=None, ploidy=2, manualCommand=None, manualGenLen=None, nThreads=None):
@@ -301,140 +726,6 @@ def runMacs(nInd, nChr=1, segSites=None, inbred=False, species="GENERIC",
     )
 
 
-def run_macs2(n_ind: int,
-              n_chr: int = 1,
-              seg_sites: Optional[Union[int, List[int]]] = None,
-              ne: float = 100,
-              bp: float = 1e8,
-              gen_len: float = 1,
-              mut_rate: float = 2.5e-8,
-              hist_ne: Optional[List[float]] = None,
-              hist_gen: Optional[List[float]] = None,
-              inbred: bool = False,
-              split: Optional[int] = None,
-              ploidy: int = 2,
-              return_command: bool = False,
-              n_threads: Optional[int] = None) -> Union[MapPop, str]:
-    """
-    Alternative wrapper for MaCS simulation
-    
-    A wrapper function for runMacs that provides a more intuitive interface
-    for writing custom commands in MaCS. It effectively automates the creation
-    of an appropriate line for the manualCommand argument in runMacs using
-    user supplied variables.
-    
-    Parameters:
-    -----------
-    n_ind : int
-        Number of individuals to simulate
-    n_chr : int, default=1
-        Number of chromosomes to simulate
-    seg_sites : int or list of int, optional
-        Number of segregating sites to keep per chromosome
-    ne : float, default=100
-        Effective population size
-    bp : float, default=1e8
-        Base pair length of chromosome
-    gen_len : float, default=1
-        Genetic length of chromosome in Morgans
-    mut_rate : float, default=2.5e-8
-        Per base pair mutation rate
-    hist_ne : list of float, optional
-        Effective population size in previous generations
-    hist_gen : list of float, optional
-        Number of generations ago for effective population sizes given in hist_ne
-    inbred : bool, default=False
-        Should founder individuals be inbred
-    split : int, optional
-        Optional historic population split in terms of generations ago
-    ploidy : int, default=2
-        Ploidy level of organism
-    return_command : bool, default=False
-        Should the command passed to manualCommand in runMacs be returned.
-        If True, MaCS will not be called and the command is returned instead.
-    n_threads : int, optional
-        Number of threads for parallel simulation. If None, automatically detected.
-    
-    Returns:
-    --------
-    MapPop or str
-        A MapPop object containing the simulated population, or if return_command
-        is True, a string giving the MaCS command passed to the manualCommand
-        argument of runMacs.
-    """
-    if hist_ne is None:
-        hist_ne = [500, 1500, 6000, 12000, 100000]
-    if hist_gen is None:
-        hist_gen = [100, 1000, 10000, 100000, 1000000]
-    
-    if len(hist_ne) != len(hist_gen):
-        raise ValueError("hist_ne and hist_gen must have the same length")
-    
-    # Adjust Ne according to ploidy level
-    ne = ne * (ploidy / 2.0)
-    if hist_ne is not None:
-        hist_ne = [h * (ploidy / 2.0) for h in hist_ne]
-    
-    # Build species parameters
-    species_params = f"{int(bp)} -t {4 * ne * mut_rate} -r {4 * ne * gen_len / bp}"
-    
-    # Build species history
-    species_hist = ""
-    if len(hist_ne) > 0:
-        hist_ne_scaled = [h / ne for h in hist_ne]
-        hist_gen_scaled = [g / (4 * ne) for g in hist_gen]
-        for i in range(len(hist_ne_scaled)):
-            species_hist += f" -eN {hist_gen_scaled[i]} {hist_ne_scaled[i]}"
-    
-    # Build command
-    if split is None:
-        command = f"{species_params}{species_hist}"
-    else:
-        pop_size = n_ind if inbred else ploidy * n_ind
-        command = f"{species_params} -I 2 {pop_size // 2} {pop_size // 2}{species_hist} -ej {split / (4 * ne) + 0.000001} 2 1"
-    
-    if return_command:
-        return command
-    
-    return run_macs(
-        n_ind=n_ind,
-        n_chr=n_chr,
-        seg_sites=seg_sites,
-        inbred=inbred,
-        species="GENERIC",  # Species not used when manual_command is provided
-        split=None,  # Split is handled in command
-        ploidy=ploidy,
-        manual_command=command,
-        manual_gen_len=gen_len,
-        n_threads=n_threads
-    )
-
-
-# Convenience function with AlphaSimR-style parameter names
-def runMacs2(nInd, nChr=1, segSites=None, Ne=100, bp=1e8, genLen=1,
-             mutRate=2.5e-8, histNe=None, histGen=None, inbred=False,
-             split=None, ploidy=2, returnCommand=False, nThreads=None):
-    """
-    Convenience function with AlphaSimR-style parameter names
-    """
-    return run_macs2(
-        n_ind=nInd,
-        n_chr=nChr,
-        seg_sites=segSites,
-        ne=Ne,
-        bp=bp,
-        gen_len=genLen,
-        mut_rate=mutRate,
-        hist_ne=histNe,
-        hist_gen=histGen,
-        inbred=inbred,
-        split=split,
-        ploidy=ploidy,
-        return_command=returnCommand,
-        n_threads=nThreads
-    )
-
-
 # Trait classes
 @dataclass
 class TraitA:
@@ -443,6 +734,14 @@ class TraitA:
     add_eff: np.ndarray
     intercept: float
     name: str
+    
+    @property
+    def addEff(self):
+        return self.add_eff
+    
+    @property
+    def nLoci(self):
+        return len(self.qtl_loci)
 
 
 @dataclass
@@ -450,29 +749,6 @@ class TraitAG:
     """Additive + GxE trait class"""
     qtl_loci: List[int]
     add_eff: np.ndarray
-    intercept: float
-    name: str
-    gxe_eff: np.ndarray
-    gxe_int: float
-    env_var: float
-
-
-@dataclass
-class TraitAD:
-    """Additive + Dominance trait class"""
-    qtl_loci: List[int]
-    add_eff: np.ndarray
-    dom_eff: np.ndarray
-    intercept: float
-    name: str
-
-
-@dataclass
-class TraitADG:
-    """Additive + Dominance + GxE trait class"""
-    qtl_loci: List[int]
-    add_eff: np.ndarray
-    dom_eff: np.ndarray
     intercept: float
     name: str
     gxe_eff: np.ndarray
@@ -495,7 +771,7 @@ class SimParam:
     pedigree tracking, and other simulation settings.
     """
     
-    def __init__(self, founder_pop: MapPop):
+    def __init__(self, founder_pop: MapPop = None, **kwargs):
         """
         Initialize SimParam with a founder population
         
@@ -504,6 +780,9 @@ class SimParam:
         founder_pop : MapPop
             The founder population used for variance scaling
         """
+        founder_pop = founder_pop or kwargs.get('founder_pop')
+        if founder_pop is None:
+            raise ValueError("founder_pop must be provided")
         # Public attributes
         self.n_threads = get_num_threads()
         self.v = 2.6  # Kosambi mapping function
@@ -551,6 +830,11 @@ class SimParam:
     def n_traits(self) -> int:
         """Number of traits"""
         return len(self._traits)
+    
+    @property
+    def traits(self):
+        """List of traits (AlphaSimR compatibility)"""
+        return self._traits
     
     @property
     def n_snp_chips(self) -> int:
@@ -969,226 +1253,6 @@ class SimParam:
         
         return self
     
-    def add_trait_adg(self, n_qtl_per_chr: Union[int, List[int]], 
-                     mean: Union[float, List[float]] = 0,
-                     var: Union[float, List[float]] = 1,
-                     var_env: Union[float, List[float]] = 0,
-                     var_gxe: Union[float, List[float]] = 1e-6,
-                     mean_dd: Union[float, List[float]] = 0,
-                     var_dd: Union[float, List[float]] = 0,
-                     cor_a: Optional[np.ndarray] = None,
-                     cor_dd: Optional[np.ndarray] = None,
-                     cor_gxe: Optional[np.ndarray] = None,
-                     use_var_a: bool = True,
-                     gamma: Union[bool, List[bool]] = False,
-                     shape: Union[float, List[float]] = 1,
-                     force: bool = False,
-                     name: Optional[Union[str, List[str]]] = None):
-        """
-        Add additive + dominance + GxE trait(s) to the simulation
-        
-        Parameters:
-        -----------
-        n_qtl_per_chr : int or list of int
-            Number of QTLs per chromosome
-        mean : float or list of float, default=0
-            Desired mean genetic values
-        var : float or list of float, default=1
-            Desired genetic variances
-        var_env : float or list of float, default=0
-            Environmental variances
-        var_gxe : float or list of float, default=1e-6
-            Total genotype-by-environment variances
-        mean_dd : float or list of float, default=0
-            Mean dominance degree
-        var_dd : float or list of float, default=0
-            Variance of dominance degree
-        cor_a : numpy.ndarray, optional
-            Correlation matrix between additive effects
-        cor_dd : numpy.ndarray, optional
-            Correlation matrix between dominance degrees
-        cor_gxe : numpy.ndarray, optional
-            Correlation matrix between GxE effects
-        use_var_a : bool, default=True
-            Tune according to additive genetic variance if True
-        gamma : bool or list of bool, default=False
-            Should gamma distribution be used instead of normal
-        shape : float or list of float, default=1
-            Shape parameter for gamma distribution
-        force : bool, default=False
-            Should the check for a running simulation be ignored
-        name : str or list of str, optional
-            Optional names for traits
-        """
-        if not force:
-            self._is_running()
-        
-        # Handle single values
-        if isinstance(n_qtl_per_chr, int):
-            n_qtl_per_chr = [n_qtl_per_chr] * self.n_chr
-        
-        if isinstance(mean, (int, float)):
-            mean = [mean]
-        if isinstance(var, (int, float)):
-            var = [var]
-        if isinstance(var_env, (int, float)):
-            var_env = [var_env]
-        if isinstance(var_gxe, (int, float)):
-            var_gxe = [var_gxe]
-        if isinstance(mean_dd, (int, float)):
-            mean_dd = [mean_dd]
-        if isinstance(var_dd, (int, float)):
-            var_dd = [var_dd]
-        if isinstance(gamma, bool):
-            gamma = [gamma] * len(mean)
-        if isinstance(shape, (int, float)):
-            shape = [shape] * len(mean)
-        
-        n_traits = len(mean)
-        
-        # Set up correlation matrices
-        if cor_a is None:
-            cor_a = np.eye(n_traits)
-        if cor_dd is None:
-            cor_dd = np.eye(n_traits)
-        if cor_gxe is None:
-            cor_gxe = np.eye(n_traits)
-        
-        # Set up trait names
-        if name is None:
-            name = [f"Trait{i+self.n_traits+1}" for i in range(n_traits)]
-        elif isinstance(name, str):
-            name = [name]
-        
-        # Validate inputs
-        if len(mean) != len(var):
-            raise ValueError("mean and var must have the same length")
-        if len(var_gxe) != n_traits:
-            raise ValueError("var_gxe must have same length as mean")
-        if len(var_env) != n_traits:
-            raise ValueError("var_env must have same length as mean")
-        if len(mean_dd) != n_traits:
-            raise ValueError("mean_dd must have same length as mean")
-        if len(var_dd) != n_traits:
-            raise ValueError("var_dd must have same length as mean")
-        if not np.allclose(cor_a, cor_a.T):
-            raise ValueError("cor_a must be symmetric")
-        if not np.allclose(cor_dd, cor_dd.T):
-            raise ValueError("cor_dd must be symmetric")
-        if not np.allclose(cor_gxe, cor_gxe.T):
-            raise ValueError("cor_gxe must be symmetric")
-        if cor_a.shape[0] != n_traits:
-            raise ValueError("cor_a must be square with dimension equal to number of traits")
-        if cor_dd.shape[0] != n_traits:
-            raise ValueError("cor_dd must be square with dimension equal to number of traits")
-        if cor_gxe.shape[0] != n_traits:
-            raise ValueError("cor_gxe must be square with dimension equal to number of traits")
-        if len(name) != n_traits:
-            raise ValueError("name must have same length as mean")
-        
-        # Pick QTL loci
-        qtl_loci = self._pick_loci(n_qtl_per_chr)
-        
-        # Flatten QTL loci from list of lists to flat list
-        flat_qtl_loci = []
-        for chr_loci in qtl_loci:
-            flat_qtl_loci.extend(chr_loci)
-        
-        # Sample additive effects
-        add_eff = self._samp_add_eff(qtl_loci, n_traits, cor_a, gamma, shape)
-        
-        # Sample dominance effects
-        dom_eff = self._samp_dom_eff(qtl_loci, n_traits, add_eff, cor_dd, mean_dd, var_dd)
-        
-        # Sample GxE effects
-        gxe_eff = self._samp_add_eff(qtl_loci, n_traits, cor_gxe, gamma=[False] * n_traits, shape=shape)
-        
-        # Create traits
-        for i in range(n_traits):
-            # Create base TraitAD
-            trait = TraitAD(
-                qtl_loci=flat_qtl_loci,
-                add_eff=add_eff[:, i],
-                dom_eff=dom_eff[:, i],
-                intercept=0,
-                name=name[i]
-            )
-            
-            # Calculate genetic parameters
-            tmp = self._calc_gen_param_ad(trait, self.founder_pop)
-            
-            if use_var_a:
-                bv_var = self._pop_var(tmp['bv'])
-                if np.isscalar(bv_var):
-                    scale = np.sqrt(var[i]) / np.sqrt(bv_var)
-                else:
-                    scale = np.sqrt(var[i]) / np.sqrt(bv_var[0])
-            else:
-                gv_var = self._pop_var(tmp['gv'])
-                if np.isscalar(gv_var):
-                    scale = np.sqrt(var[i]) / np.sqrt(gv_var)
-                else:
-                    scale = np.sqrt(var[i]) / np.sqrt(gv_var[0])
-            
-            trait.add_eff = trait.add_eff * scale
-            trait.dom_eff = trait.dom_eff * scale
-            trait.intercept = mean[i] - np.mean(tmp['gv'] * scale)
-            
-            # GxE component
-            trait_g = TraitA(
-                qtl_loci=flat_qtl_loci,
-                add_eff=gxe_eff[:, i],
-                intercept=0,
-                name=name[i]
-            )
-            tmp_g = self._calc_gen_param(trait_g, self.founder_pop)
-            
-            gv_var_g = self._pop_var(tmp_g['gv'])
-            if np.isscalar(gv_var_g):
-                gv_var_g_val = gv_var_g
-            else:
-                gv_var_g_val = gv_var_g[0]
-            
-            if var_env[i] == 0:
-                scale_g = np.sqrt(var_gxe[i]) / np.sqrt(gv_var_g_val)
-                trait_adg = TraitADG(
-                    qtl_loci=flat_qtl_loci,
-                    add_eff=trait.add_eff,
-                    dom_eff=trait.dom_eff,
-                    intercept=trait.intercept,
-                    name=name[i],
-                    gxe_eff=gxe_eff[:, i] * scale_g,
-                    gxe_int=0 - np.mean(tmp_g['gv'] * scale_g),
-                    env_var=1
-                )
-            else:
-                scale_g = np.sqrt(var_gxe[i] / var_env[i]) / np.sqrt(gv_var_g_val)
-                trait_adg = TraitADG(
-                    qtl_loci=flat_qtl_loci,
-                    add_eff=trait.add_eff,
-                    dom_eff=trait.dom_eff,
-                    intercept=trait.intercept,
-                    name=name[i],
-                    gxe_eff=gxe_eff[:, i] * scale_g,
-                    gxe_int=1 - np.mean(tmp_g['gv'] * scale_g),
-                    env_var=var_env[i]
-                )
-            
-            if use_var_a:
-                gv_var_scaled = self._pop_var(tmp['gv'] * scale)
-                if np.isscalar(gv_var_scaled):
-                    self._add_trait(trait_adg, var[i], gv_var_scaled)
-                else:
-                    self._add_trait(trait_adg, var[i], gv_var_scaled[0])
-            else:
-                bv_var_scaled = self._pop_var(tmp['bv'] * scale)
-                if np.isscalar(bv_var_scaled):
-                    self._add_trait(trait_adg, bv_var_scaled, var[i])
-                else:
-                    self._add_trait(trait_adg, bv_var_scaled[0], var[i])
-        
-        return self
-    
     def add_snp_chip(self, n_snp_per_chr: Union[int, List[int]], 
                     name: Optional[str] = None):
         """
@@ -1214,6 +1278,54 @@ class SimParam:
         self.snp_chips.append(snp_chip)
         
         return self
+    
+    def import_trait(self, marker_names, add_eff, dom_eff=None, intercept=None,
+                    name=None, var_e=None, force=False):
+        """
+        Import trait from marker effects. From AlphaSimR SimParam importTrait.
+        """
+        add_eff = np.atleast_2d(np.asarray(add_eff))
+        if add_eff.shape[0] == 1:
+            add_eff = add_eff.T
+        marker_names = np.atleast_1d(marker_names)
+        if len(marker_names) != add_eff.shape[0]:
+            raise ValueError("markerNames length must match addEff rows")
+        n_traits = add_eff.shape[1]
+        intercept = np.zeros(n_traits) if intercept is None else np.atleast_1d(intercept)
+        if len(intercept) != n_traits:
+            raise ValueError("intercept length must match n_traits")
+        name = name or [f"Trait{i+self.n_traits+1}" for i in range(n_traits)]
+        if not isinstance(name, (list, tuple, np.ndarray)):
+            name = [name]
+        if len(name) != n_traits:
+            raise ValueError("name length must match n_traits")
+        gen_map_names = getattr(self.founder_pop, 'gen_map_names', None)
+        if gen_map_names is None:
+            raise ValueError("Founder population must have gen_map_names for importTrait (use importHaplo)")
+        flat_loci = []
+        flat_eff = []
+        offset = 0
+        for chr_idx in range(self.n_chr):
+            chr_names = gen_map_names[chr_idx]
+            for loc_idx, m in enumerate(chr_names):
+                if m in marker_names:
+                    pos = np.where(marker_names == m)[0][0]
+                    flat_loci.append(offset + loc_idx)
+                    flat_eff.append(add_eff[pos, :])
+            offset += self.founder_pop.n_loci[chr_idx]
+        if len(flat_loci) == 0:
+            raise ValueError("No marker names matched the genetic map")
+        flat_eff = np.array(flat_eff)
+        for trt_idx in range(n_traits):
+            trait = TraitA(qtl_loci=flat_loci, add_eff=flat_eff[:, trt_idx],
+                          intercept=intercept[trt_idx], name=name[trt_idx])
+            var_a = np.var(flat_eff[:, trt_idx])
+            self._add_trait(trait, var_a, var_a)
+        return self
+    
+    def importTrait(self, markerNames, addEff, domEff=None, intercept=None, name=None, varE=None, force=False):
+        """Convenience method with AlphaSimR-style parameter names"""
+        return self.import_trait(markerNames, addEff, domEff, intercept, name, varE, force)
     
     def _is_running(self):
         """Check if simulation is running (placeholder)"""
@@ -1310,48 +1422,6 @@ class SimParam:
         
         return effects
     
-    def _samp_dom_eff(self, qtl_loci: List[List[int]], n_traits: int,
-                     add_eff: np.ndarray, cor_dd: np.ndarray,
-                     mean_dd: List[float], var_dd: List[float]) -> np.ndarray:
-        """
-        Sample dominance effects for QTL
-        
-        Parameters:
-        -----------
-        qtl_loci : list of list of int
-            QTL loci for each chromosome
-        n_traits : int
-            Number of traits
-        add_eff : numpy.ndarray
-            Previously sampled additive effects
-        cor_dd : numpy.ndarray
-            Correlation matrix between dominance degrees
-        mean_dd : list of float
-            Mean value of dominance degrees
-        var_dd : list of float
-            Variance of dominance degrees
-        
-        Returns:
-        --------
-        numpy.ndarray
-            Dominance effects matrix
-        """
-        n_qtl = sum(len(chr_loci) for chr_loci in qtl_loci)
-        
-        # Sample dominance degrees from normal distribution with correlation
-        chol = np.linalg.cholesky(cor_dd)
-        dom_eff = np.random.normal(0, 1, (n_qtl, n_traits))
-        dom_eff = dom_eff @ chol.T
-        
-        # Scale by variance and add mean
-        for i in range(n_traits):
-            dom_eff[:, i] = dom_eff[:, i] * np.sqrt(var_dd[i]) + mean_dd[i]
-        
-        # Multiply by absolute additive effects
-        dom_eff = np.abs(add_eff) * dom_eff
-        
-        return dom_eff
-    
     def _calc_gen_param(self, trait: TraitA, pop: MapPop) -> Dict[str, np.ndarray]:
         """
         Calculate genetic parameters for a trait
@@ -1421,90 +1491,6 @@ class SimParam:
         
         return {'bv': bv, 'gv': gv}
     
-    def _calc_gen_param_ad(self, trait: TraitAD, pop: MapPop) -> Dict[str, np.ndarray]:
-        """
-        Calculate genetic parameters for a trait with additive and dominance effects
-        
-        Parameters:
-        -----------
-        trait : TraitAD
-            The trait to calculate parameters for
-        pop : MapPop
-            Population to calculate parameters on
-        
-        Returns:
-        --------
-        dict
-            Dictionary containing breeding values and genetic values
-        """
-        # Calculate actual genetic values from QTL effects
-        n_ind = pop.n_ind
-        gv = np.zeros(n_ind)
-        bv = np.zeros(n_ind)  # Breeding values (additive only)
-        
-        # Calculate genetic values for each individual
-        for ind_idx in range(n_ind):
-            total_gv = trait.intercept
-            total_bv = 0  # Breeding value (additive only)
-            
-            # Sum QTL effects across all QTL positions
-            for qtl_idx, qtl_pos in enumerate(trait.qtl_loci):
-                # For single chromosome, QTL positions are already local
-                if pop.n_chr == 1:
-                    local_pos = qtl_pos
-                    chr_idx = 0
-                else:
-                    # Find which chromosome this QTL is on
-                    chr_idx = 0
-                    cumulative_loci = 0
-                    for c in range(pop.n_chr):
-                        if qtl_pos < cumulative_loci + pop.n_loci[c]:
-                            chr_idx = c
-                            break
-                        cumulative_loci += pop.n_loci[c]
-                    
-                    # Get local position within chromosome
-                    local_pos = qtl_pos - cumulative_loci
-                
-                if local_pos < pop.n_loci[chr_idx]:
-                    # Get genotype at QTL position (unpack from binary format)
-                    bin_idx = local_pos // 8
-                    bit_idx = local_pos % 8
-                    
-                    # Extract genotype from packed format
-                    dosage = 0
-                    for ploidy_idx in range(pop.ploidy):
-                        if pop.geno[chr_idx][bin_idx, ploidy_idx, ind_idx] & (1 << bit_idx):
-                            dosage += 1
-                    
-                    # Calculate additive effect
-                    # Scale dosage to [-1, 1] range for additive effects
-                    scaled_dosage = (dosage - pop.ploidy/2) * (2/pop.ploidy)
-                    
-                    # Add QTL additive effect
-                    if qtl_idx < len(trait.add_eff):
-                        add_contribution = trait.add_eff[qtl_idx] * scaled_dosage
-                        total_gv += add_contribution
-                        total_bv += add_contribution
-                    
-                    # Add dominance effect (only for heterozygous genotypes)
-                    if qtl_idx < len(trait.dom_eff):
-                        # For diploid: dominance only when dosage = 1 (heterozygous)
-                        # For polyploid: dominance when not fully homozygous
-                        if pop.ploidy == 2:
-                            if dosage == 1:  # Heterozygous
-                                total_gv += trait.dom_eff[qtl_idx]
-                        else:
-                            # For polyploids, use a simplified dominance model
-                            # Dominance effect is proportional to heterozygosity
-                            heterozygosity = 1.0 - abs(scaled_dosage)  # 1 when heterozygous, 0 when homozygous
-                            total_gv += trait.dom_eff[qtl_idx] * heterozygosity
-            
-            gv[ind_idx] = total_gv
-            bv[ind_idx] = total_bv
-        
-        return {'bv': bv, 'gv': gv}
-    
     def _pop_var(self, x: np.ndarray) -> np.ndarray:
         """
         Calculate population variance (divide by n instead of n-1)
@@ -1538,115 +1524,17 @@ class SimParam:
         self._var_a.append(var_a)
         self._var_g.append(var_g)
         self._var_e.append(1.0)  # Default error variance
-    
-    def set_var_e(self, h2=None, H2=None, var_e=None, cor_e=None):
-        """
-        Set error variance for traits
-        
-        Parameters:
-        -----------
-        h2 : float or list of float, optional
-            Narrow-sense heritabilities for each trait
-        H2 : float or list of float, optional
-            Broad-sense heritabilities for each trait
-        var_e : float, list of float, or numpy.ndarray, optional
-            Error variance(s) for each trait. Can be a vector or covariance matrix.
-        cor_e : numpy.ndarray, optional
-            Correlation matrix for error variances
-        
-        Returns:
-        --------
-        SimParam
-            Returns self for method chaining
-        """
-        n_traits = self.n_traits
-        
-        # Check validity of corE, if supplied
-        if cor_e is not None:
-            if not np.allclose(cor_e, cor_e.T):
-                raise ValueError("corE must be symmetric")
-            if cor_e.shape[0] != n_traits:
-                raise ValueError(f"corE must be square with dimension equal to number of traits ({n_traits})")
-        
-        # Set error variances
-        if h2 is not None:
-            if isinstance(h2, (int, float)):
-                h2 = [h2]
-            if len(h2) != n_traits:
-                raise ValueError(f"h2 must have length equal to number of traits ({n_traits})")
-            if not all(self._var_g[i] > 0 for i in range(n_traits)):
-                raise ValueError("All varG must be > 0 when using h2")
-            if not all(self._var_a[i] > 0 for i in range(n_traits)):
-                raise ValueError("All varA must be > 0 when using h2")
-            
-            var_e = []
-            for i in range(n_traits):
-                tmp = self._var_a[i] / h2[i] - self._var_g[i]
-                if tmp < 0:
-                    raise ValueError(f"h2={h2[i]} is not possible for trait {i+1}")
-                var_e.append(tmp)
-            self._var_e = var_e
-            
-        elif H2 is not None:
-            if isinstance(H2, (int, float)):
-                H2 = [H2]
-            if len(H2) != n_traits:
-                raise ValueError(f"H2 must have length equal to number of traits ({n_traits})")
-            
-            var_e = []
-            for i in range(n_traits):
-                tmp = self._var_g[i] / H2[i] - self._var_g[i]
-                var_e.append(tmp)
-            self._var_e = var_e
-            
-        elif var_e is not None:
-            if isinstance(var_e, (int, float)):
-                var_e = [var_e] * n_traits
-            elif isinstance(var_e, np.ndarray):
-                if var_e.ndim == 2:
-                    # Matrix - check dimensions
-                    if var_e.shape[0] != n_traits or var_e.shape[1] != n_traits:
-                        raise ValueError(f"varE matrix must be {n_traits}x{n_traits}")
-                    self._var_e = var_e
-                else:
-                    # Vector
-                    if len(var_e) != n_traits:
-                        raise ValueError(f"varE must have length equal to number of traits ({n_traits})")
-                    self._var_e = var_e.tolist()
-            else:
-                # List
-                if len(var_e) != n_traits:
-                    raise ValueError(f"varE must have length equal to number of traits ({n_traits})")
-                self._var_e = var_e
-        else:
-            self._var_e = [np.nan] * n_traits
-        
-        # Set error correlations
-        if cor_e is not None:
-            if isinstance(self._var_e, np.ndarray) and self._var_e.ndim == 2:
-                var_e_diag = np.diag(self._var_e)
-            else:
-                var_e_diag = np.array(self._var_e)
-            
-            var_e_sqrt = np.diag(np.sqrt(var_e_diag))
-            var_e_matrix = var_e_sqrt @ cor_e @ var_e_sqrt
-            self._var_e = var_e_matrix
-        
-        return self
 
 
 # Add convenience methods to SimParam class
-def addTraitA(self, nQtlPerChr, mean=0, var=1, corA=None, gamma=False, shape=1, force=False, name=None):
+def addTraitA(self, nQtlPerChr=None, n_qtl_per_chr=None, mean=0, var=1, corA=None, gamma=False, shape=1, force=False, name=None):
     """Convenience method with AlphaSimR-style parameter names"""
-    return self.add_trait_a(nQtlPerChr, mean, var, corA, gamma, shape, force, name)
+    n = nQtlPerChr if nQtlPerChr is not None else n_qtl_per_chr
+    return self.add_trait_a(n, mean, var, corA, gamma, shape, force, name)
 
 def addTraitAG(self, nQtlPerChr, mean=0, var=1, varGxE=1e-6, varEnv=0, corA=None, corGxE=None, gamma=False, shape=1, force=False, name=None):
     """Convenience method with AlphaSimR-style parameter names"""
     return self.add_trait_ag(nQtlPerChr, mean, var, varGxE, varEnv, corA, corGxE, gamma, shape, force, name)
-
-def addTraitADG(self, nQtlPerChr, mean=0, var=1, varEnv=0, varGxE=1e-6, meanDD=0, varDD=0, corA=None, corDD=None, corGxE=None, useVarA=True, gamma=False, shape=1, force=False, name=None):
-    """Convenience method with AlphaSimR-style parameter names"""
-    return self.add_trait_adg(nQtlPerChr, mean, var, varEnv, varGxE, meanDD, varDD, corA, corDD, corGxE, useVarA, gamma, shape, force, name)
 
 def restrSegSites(self, minQtlPerChr=None, minSnpPerChr=None, excludeQtl=None, excludeSnp=None, overlap=False, minSnpFreq=None):
     """Convenience method with AlphaSimR-style parameter names"""
@@ -1672,20 +1560,36 @@ def setSexes(self, sexes, force=False):
     """Convenience method with AlphaSimR-style parameter names"""
     return self.set_sexes(sexes, force)
 
-def setVarE(self, h2=None, H2=None, varE=None, corE=None):
-    """Convenience method with AlphaSimR-style parameter names"""
-    return self.set_var_e(h2, H2, varE, corE)
-
 # Add methods to SimParam class
 SimParam.addTraitA = addTraitA
 SimParam.addTraitAG = addTraitAG
-SimParam.addTraitADG = addTraitADG
 SimParam.restrSegSites = restrSegSites
 SimParam.addSnpChip = addSnpChip
 SimParam.setTrackPed = setTrackPed
 SimParam.setTrackRec = setTrackRec
 SimParam.resetPed = resetPed
 SimParam.setSexes = setSexes
+
+
+def setVarE(self, h2=None, H2=None, varE=None, var_e=None, corE=None):
+    """Set error variance from h2, H2, or varE. From AlphaSimR SimParam setVarE."""
+    varE = varE or var_e
+    if varE is not None:
+        varE = np.atleast_1d(varE)
+        self._var_e = list(varE)
+    elif h2 is not None:
+        h2 = np.atleast_1d(h2)
+        var_g = np.array(self._var_g)
+        self._var_e = list(var_g * (1 - h2) / h2)
+    elif H2 is not None:
+        H2 = np.atleast_1d(H2)
+        var_g = np.array(self._var_g)
+        self._var_e = list(var_g * (1 - H2) / H2)
+    else:
+        raise ValueError("Must provide h2, H2, or varE")
+    return self
+
+
 SimParam.setVarE = setVarE
 
 
@@ -1762,44 +1666,99 @@ class Pop:
         for i, father_id in enumerate(self.father):
             if ' ' in father_id:
                 raise ValueError(f"father[{i}] cannot contain spaces")
-
-
-@dataclass
-class HybridPop:
-    """Hybrid population class - lightweight version of Pop without genotypic data"""
-    n_ind: int
-    id: List[str]
-    mother: List[str]
-    father: List[str]
-    n_traits: int
-    gv: np.ndarray
-    pheno: np.ndarray
-    gxe: List[Any]
     
-    def __post_init__(self):
-        """Validate the HybridPop object"""
-        if any(' ' in individual_id for individual_id in self.id):
-            raise ValueError("id cannot contain spaces")
-        if any(' ' in mother_id for mother_id in self.mother):
-            raise ValueError("mother cannot contain spaces")
-        if any(' ' in father_id for father_id in self.father):
-            raise ValueError("father cannot contain spaces")
-        if self.n_ind != len(self.id):
-            raise ValueError("nInd != length(id)")
-        if self.n_ind != len(self.mother):
-            raise ValueError("nInd != length(mother)")
-        if self.n_ind != len(self.father):
-            raise ValueError("nInd != length(father)")
-        if self.n_ind != self.gv.shape[0]:
-            raise ValueError("nInd != nrow(gv)")
-        if self.n_ind != self.pheno.shape[0]:
-            raise ValueError("nInd != nrow(pheno)")
-        if self.n_traits != self.gv.shape[1]:
-            raise ValueError("nTraits != ncol(gv)")
-        if self.n_traits != self.pheno.shape[1]:
-            raise ValueError("nTraits != ncol(pheno)")
-        if self.n_traits != len(self.gxe):
-            raise ValueError("nTraits != length(gxe)")
+    def __getitem__(self, i):
+        """Subset Pop by individual index or id. From AlphaSimR Pop [ method."""
+        if isinstance(i, (slice, list, np.ndarray)):
+            idx = np.arange(self.n_ind)[i]
+        elif isinstance(i, str):
+            idx = np.where(np.array(self.id) == i)[0]
+            if len(idx) == 0:
+                raise ValueError("Trying to select invalid individuals")
+            idx = idx[0]
+        else:
+            idx = i
+            if isinstance(idx, np.ndarray):
+                idx = idx.tolist()
+            if isinstance(idx, (list, np.ndarray)):
+                idx = np.asarray(idx)
+                if np.any(np.abs(idx) > self.n_ind):
+                    raise ValueError("Trying to select invalid individuals")
+                idx = (np.arange(self.n_ind)[idx] if np.any(idx < 0) else idx)
+            else:
+                if abs(idx) > self.n_ind:
+                    raise ValueError("Trying to select invalid individuals")
+                idx = np.arange(self.n_ind)[idx] if idx < 0 else idx
+        idx = np.atleast_1d(idx)
+        if idx.ndim == 0:
+            idx = idx.reshape(1)
+        subset_misc = {}
+        for k, v in self.misc.items():
+            if isinstance(v, np.ndarray) and v.ndim > 0:
+                subset_misc[k] = v[idx] if v.shape[0] == self.n_ind else v
+            else:
+                subset_misc[k] = [v[i] for i in idx] if hasattr(v, '__getitem__') else v
+        return Pop(
+            n_ind=len(idx), n_chr=self.n_chr, ploidy=self.ploidy, n_loci=self.n_loci,
+            geno=[g[:, :, idx] for g in self.geno], gen_map=self.gen_map,
+            centromere=self.centromere, inbred=self.inbred,
+            id=[self.id[j] for j in idx], iid=[self.iid[j] for j in idx],
+            mother=[self.mother[j] for j in idx], father=[self.father[j] for j in idx],
+            sex=[self.sex[j] for j in idx], n_traits=self.n_traits,
+            gv=self.gv[idx], pheno=self.pheno[idx], ebv=self.ebv[idx],
+            gxe=self.gxe, fix_eff=[self.fix_eff[j] for j in idx],
+            misc=subset_misc, misc_pop={}
+        )
+
+
+def merge_pops(pop_list) -> Pop:
+    """Merge list of Pop objects. From AlphaSimR mergePops.R"""
+    if hasattr(pop_list, 'pops'):
+        pop_list = pop_list.pops
+    pop_list = [p for p in pop_list if p is not None and isinstance(p, Pop)]
+    if not pop_list:
+        raise ValueError("popList must contain Pop objects")
+    n_chr = pop_list[0].n_chr
+    ploidy = pop_list[0].ploidy
+    n_loci = pop_list[0].n_loci
+    for p in pop_list[1:]:
+        if p.n_chr != n_chr or p.ploidy != ploidy or not all(np.array(p.n_loci) == np.array(n_loci)):
+            raise ValueError("All populations must have compatible structure")
+    misc = {}
+    if all(len(p.misc) == len(pop_list[0].misc) for p in pop_list) and len(pop_list[0].misc) > 0:
+        if all(set(p.misc.keys()) == set(pop_list[0].misc.keys()) for p in pop_list):
+            for k in pop_list[0].misc.keys():
+                vals = [p.misc[k] for p in pop_list]
+                if isinstance(vals[0], np.ndarray) and vals[0].ndim > 0:
+                    misc[k] = np.vstack(vals) if vals[0].ndim > 1 else np.concatenate(vals)
+                else:
+                    misc[k] = np.concatenate([np.atleast_1d(v) for v in vals])
+    n_ind = sum(p.n_ind for p in pop_list)
+    geno = []
+    for chr_idx in range(n_chr):
+        geno.append(np.concatenate([p.geno[chr_idx] for p in pop_list], axis=2))
+    return Pop(
+        n_ind=n_ind, n_chr=n_chr, ploidy=ploidy, n_loci=n_loci,
+        geno=geno, gen_map=pop_list[0].gen_map, centromere=pop_list[0].centromere,
+        inbred=pop_list[0].inbred,
+        id=[x for p in pop_list for x in p.id],
+        iid=[x for p in pop_list for x in p.iid],
+        mother=[x for p in pop_list for x in p.mother],
+        father=[x for p in pop_list for x in p.father],
+        sex=[x for p in pop_list for x in p.sex],
+        n_traits=pop_list[0].n_traits,
+        gv=np.vstack([p.gv for p in pop_list]),
+        pheno=np.vstack([p.pheno for p in pop_list]),
+        ebv=np.vstack([p.ebv for p in pop_list]) if pop_list[0].ebv.shape[1] > 0 else np.empty((n_ind, 0)),
+        gxe=pop_list[0].gxe,
+        fix_eff=[x for p in pop_list for x in p.fix_eff],
+        misc=misc, misc_pop={}
+    )
+
+
+def mergePops(popList):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return merge_pops(popList)
 
 
 def new_pop(raw_pop: MapPop, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
@@ -2072,15 +2031,6 @@ def meanP(pop: Pop) -> np.ndarray:
     return mean_p(pop)
 
 
-def nInd(pop: Pop) -> int:
-    """
-    Return the number of individuals in a population.
-
-    Mirrors AlphaSimR::nInd by exposing the n_ind field.
-    """
-    return int(pop.n_ind)
-
-
 # Phenotype functions
 def set_pheno(pop: Pop, var_e: Optional[Union[float, List[float], np.ndarray]] = None,
               reps: int = 1, sim_param: Optional[SimParam] = None) -> Pop:
@@ -2143,180 +2093,117 @@ def setPheno(pop: Pop, varE: Optional[Union[float, List[float], np.ndarray]] = N
     return set_pheno(pop, varE, reps, simParam)
 
 
-def merge_pops(pop_list: List[Pop]) -> Pop:
-    """
-    Merge a list of Pop objects into a single Pop.
-
-    This function closely mirrors AlphaSimR::mergePops for single Pop
-    objects and assumes all populations share the same genetic map.
-    """
-    # Drop None entries to mirror R's behavior of skipping NULL
-    pop_list = [p for p in pop_list if p is not None]
-    if not pop_list:
-        raise ValueError("popList must contain at least one Pop")
-
-    # All elements must be Pop instances
-    for p in pop_list:
-        if not isinstance(p, Pop):
-            raise TypeError("All elements of popList must be Pop instances")
-
-    first = pop_list[0]
-
-    # Check core structural compatibility: n_chr, ploidy, n_loci
-    for p in pop_list[1:]:
-        if p.n_chr != first.n_chr:
-            raise ValueError("All populations must have the same n_chr")
-        if p.ploidy != first.ploidy:
-            raise ValueError("All populations must have the same ploidy")
-        if p.n_loci != first.n_loci:
-            raise ValueError("All populations must have identical n_loci")
-
-    # Check genetic map compatibility (not present in AlphaSimR::mergePops but
-    # required for the Python Pop definition)
-    for p in pop_list[1:]:
-        for chr_idx in range(first.n_chr):
-            if not np.array_equal(first.gen_map[chr_idx], p.gen_map[chr_idx]):
-                raise ValueError("All populations must have identical gen_map")
-            if first.centromere[chr_idx] != p.centromere[chr_idx]:
-                raise ValueError("All populations must have identical centromere positions")
-
-    # n_traits
-    n_traits_list = [p.n_traits for p in pop_list]
-    if any(n != n_traits_list[0] for n in n_traits_list):
-        raise ValueError("All populations must have the same n_traits")
-    n_traits = n_traits_list[0]
-
-    # n_ind per population and total
-    n_ind_list = [p.n_ind for p in pop_list]
-    total_n_ind = int(sum(n_ind_list))
-
-    # id, iid, parents, sex, fixed effects
-    id_list: List[str] = []
-    iid_list: List[int] = []
-    mother_list: List[str] = []
-    father_list: List[str] = []
-    sex_list: List[str] = []
-    fix_eff_list: List[int] = []
-
-    for p in pop_list:
-        id_list.extend(p.id)
-        iid_list.extend(p.iid)
-        mother_list.extend(p.mother)
-        father_list.extend(p.father)
-        sex_list.extend(p.sex)
-        fix_eff_list.extend(p.fix_eff)
-
-    # misc: only merge when all populations have the same non-empty key set
-    misc_merged: Dict[str, Any] = {}
-    if all(isinstance(p.misc, dict) for p in pop_list):
-        key_sets = [set(p.misc.keys()) for p in pop_list]
-        if key_sets and all(ks == key_sets[0] for ks in key_sets) and len(key_sets[0]) > 0:
-            for key in key_sets[0]:
-                vals = [p.misc[key] for p in pop_list]
-                first_val = vals[0]
-                # If matrix-like (2D ndarray), stack row-wise as in rbind
-                if isinstance(first_val, np.ndarray) and first_val.ndim == 2:
-                    misc_merged[key] = np.vstack(vals)
-                else:
-                    # Otherwise, concatenate sensibly
-                    try:
-                        misc_merged[key] = np.concatenate(vals)
-                    except Exception:
-                        combined: List[Any] = []
-                        for v in vals:
-                            if isinstance(v, (list, tuple)):
-                                combined.extend(v)
-                            else:
-                                combined.append(v)
-                        misc_merged[key] = combined
-
-    # n_traits, gv, pheno
-    if n_traits > 0 and total_n_ind > 0:
-        gv = np.vstack([p.gv for p in pop_list])
-        pheno = np.vstack([p.pheno for p in pop_list])
-    else:
-        gv = np.empty((total_n_ind, n_traits))
-        pheno = np.empty((total_n_ind, n_traits))
-
-    # ebv: only merge if all have same number of columns, otherwise 0-col matrix
-    ebv_cols = [p.ebv.shape[1] for p in pop_list]
-    if all(c == ebv_cols[0] for c in ebv_cols):
-        if ebv_cols[0] > 0 and total_n_ind > 0:
-            ebv = np.vstack([p.ebv for p in pop_list])
-        else:
-            ebv = np.empty((total_n_ind, 0))
-    else:
-        ebv = np.empty((total_n_ind, 0))
-
-    # gxe: concatenate per trait when present
-    if n_traits >= 1:
-        gxe_merged: List[Any] = [None] * n_traits
-        for trait_idx in range(n_traits):
-            first_val = pop_list[0].gxe[trait_idx] if pop_list[0].gxe else None
-            if first_val is None:
-                continue
-            vals = [p.gxe[trait_idx] for p in pop_list]
-            if isinstance(first_val, np.ndarray):
-                gxe_merged[trait_idx] = np.concatenate(vals, axis=0)
+def _cut_r_style(x: np.ndarray, breaks: np.ndarray, include_lowest: bool, right: bool) -> np.ndarray:
+    """Replicate R's cut() behavior. Returns 1-indexed categories, NaN for out of range."""
+    result = np.full_like(x, np.nan, dtype=float)
+    breaks = np.asarray(breaks)
+    n_breaks = len(breaks)
+    if n_breaks < 2:
+        return result
+    # right=FALSE: [a,b) intervals. include.lowest=TRUE: last interval includes upper bound.
+    for i in range(n_breaks - 1):
+        lo, hi = breaks[i], breaks[i + 1]
+        if right:
+            # (a,b] - exclude left, include right
+            if i == 0 and include_lowest:
+                mask = (x >= lo) & (x <= hi)
             else:
-                combined: List[Any] = []
-                for v in vals:
-                    if isinstance(v, (list, tuple)):
-                        combined.extend(v)
-                    else:
-                        combined.append(v)
-                gxe_merged[trait_idx] = combined
-    else:
-        gxe_merged = []
-
-    # geno: concatenate along individual dimension for each chromosome
-    merged_geno: List[np.ndarray] = []
-    for chr_idx in range(first.n_chr):
-        geno_arrays = [p.geno[chr_idx] for p in pop_list]
-        base_shape = geno_arrays[0].shape[:2]
-        for arr in geno_arrays:
-            if arr.shape[:2] != base_shape:
-                raise ValueError("Incompatible geno shapes across populations")
-        if total_n_ind > 0:
-            merged_chr = np.concatenate(geno_arrays, axis=2)
+                mask = (x > lo) & (x <= hi)
         else:
-            merged_chr = geno_arrays[0][:, :, :0]
-        merged_geno.append(merged_chr)
-
-    # inbred flag: AND across populations (as in AlphaSimR for MapPop)
-    inbred_flag = all(p.inbred for p in pop_list)
-
-    # Construct merged population
-    merged_pop = Pop(
-        n_ind=total_n_ind,
-        n_chr=first.n_chr,
-        ploidy=first.ploidy,
-        n_loci=first.n_loci,
-        geno=merged_geno,
-        gen_map=first.gen_map,
-        centromere=first.centromere,
-        inbred=inbred_flag,
-        id=id_list,
-        iid=iid_list,
-        mother=mother_list,
-        father=father_list,
-        sex=sex_list,
-        n_traits=n_traits,
-        gv=gv,
-        pheno=pheno,
-        ebv=ebv,
-        gxe=gxe_merged,
-        fix_eff=fix_eff_list,
-        misc=misc_merged,
-        misc_pop={}
-    )
-
-    return merged_pop
+            # [a,b) - include left, exclude right
+            if i == n_breaks - 2 and include_lowest:
+                mask = (x >= lo) & (x <= hi)
+            else:
+                mask = (x >= lo) & (x < hi)
+        result[mask] = i + 1
+    return result
 
 
-def mergePops(popList: List[Pop]) -> Pop:
-    """Convenience wrapper with AlphaSimR-style name."""
-    return merge_pops(popList)
+def as_categorical(x: np.ndarray, p: Optional[Union[float, np.ndarray, List]] = None,
+                   mean: Union[float, np.ndarray] = 0, var: Union[float, np.ndarray] = 1,
+                   threshold: Union[np.ndarray, List] = None,
+                   include_lowest: bool = True, right: bool = False) -> np.ndarray:
+    """
+    Convert continuous (Gaussian) trait to categorical via ordered probit.
+    From AlphaSimR phenotypes.R asCategorical.
+    """
+    import warnings
+    from scipy import stats
+    
+    x = np.asarray(x)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    n_traits = x.shape[1]
+    
+    if p is not None:
+        if np.isscalar(p):
+            if n_traits > 1:
+                raise ValueError("When x contains more than one column, you must supply a list of probabilities!")
+            if p == 0.5 and n_traits == 1:
+                p = [np.array([0.5, 0.5])]
+            else:
+                p = [p]
+        elif isinstance(p, (list, tuple)) and len(p) == n_traits:
+            p = list(p)
+        else:
+            p_arr = np.atleast_1d(p)
+            # When n_traits==1 and p is category probs (e.g. [0.5, 0.5]), wrap as [p]
+            if n_traits == 1 and len(p_arr) > 0 and np.isscalar(p_arr.flat[0]):
+                p = [p_arr]
+            else:
+                p = list(p) if hasattr(p, '__iter__') and not isinstance(p, np.ndarray) else [p]
+        if len(p) != n_traits:
+            raise ValueError("You must supply probabilities for all traits in x!")
+        mean_arr = np.atleast_1d(mean)
+        var_arr = np.atleast_1d(var)
+        if any(pp is not None for pp in p):
+            if len(mean_arr) != n_traits:
+                raise ValueError("You must supply means for all traits in x!")
+            if len(var_arr) != n_traits:
+                raise ValueError("You must supply variances for all traits in x!")
+        threshold = []
+        for trt in range(n_traits):
+            p_trt = p[trt]
+            if p_trt is None:
+                threshold.append(None)
+                continue
+            p_trt = np.atleast_1d(p_trt)
+            p_sum = np.sum(p_trt)
+            if not np.isclose(p_sum, 1):
+                warnings.warn("Probabilities do not sum to 1 - creating one more category!")
+                p_trt = np.concatenate([p_trt, [1 - p_sum]])
+            tmp = stats.norm.ppf(np.cumsum(p_trt), loc=mean_arr[trt], scale=np.sqrt(var_arr[trt]))
+            if not np.any(np.isinf(tmp) & (tmp < 0)):
+                tmp = np.concatenate([[-np.inf], tmp])
+            if not np.any(np.isinf(tmp) & (tmp > 0)):
+                tmp = np.concatenate([tmp, [np.inf]])
+            threshold.append(tmp)
+    
+    if threshold is None:
+        if n_traits > 1:
+            raise ValueError("When x contains more than one column, you must supply a list of thresholds!")
+        threshold = [np.array([-np.inf, 0, np.inf])]
+    
+    if not isinstance(threshold, (list, tuple)):
+        threshold = [np.asarray(threshold)]
+    else:
+        threshold = [np.asarray(t) if t is not None else None for t in threshold]
+    
+    if len(threshold) != n_traits:
+        raise ValueError("You must supply thresholds for all traits in x!")
+    
+    result = x.copy().astype(float)
+    for trt in range(n_traits):
+        if threshold[trt] is not None:
+            result[:, trt] = _cut_r_style(
+                x[:, trt], threshold[trt], include_lowest, right
+            )
+    return result
+
+
+def asCategorical(x, p=None, mean=0, var=1, threshold=None, includeLowest=True, right=False):
+    """Convenience function with AlphaSimR-style parameter names"""
+    return as_categorical(x, p, mean, var, threshold, includeLowest, right)
 
 
 # Selection functions
@@ -2422,11 +2309,11 @@ def select_ind(pop: Pop, n_ind: int, trait: Union[int, callable] = 1,
     if values.ndim > 1:
         values = values.flatten()
     
-    # Select individuals
+    # Select individuals (match R order(): decreasing=selectTop gives highest first)
     eligible_values = values[eligible]
     sorted_indices = np.argsort(eligible_values)
     if select_top:
-        selected_indices = sorted_indices[-n_ind:]
+        selected_indices = sorted_indices[-n_ind:][::-1]
     else:
         selected_indices = sorted_indices[:n_ind]
     
@@ -2455,9 +2342,12 @@ def select_ind(pop: Pop, n_ind: int, trait: Union[int, callable] = 1,
 def selectInd(pop: Pop, nInd: int, trait: Union[int, callable] = 1,
               use: str = "pheno", sex: str = "B", selectTop: bool = True,
               returnPop: bool = True, candidates: Optional[List[int]] = None,
-              simParam: Optional[SimParam] = None, **kwargs) -> Union[Pop, List[int]]:
+              simParam: Optional[SimParam] = None, sim_param: Optional[SimParam] = None, **kwargs) -> Union[Pop, List[int]]:
     """Convenience function with AlphaSimR-style parameter names"""
-    return select_ind(pop, nInd, trait, use, sex, selectTop, returnPop, candidates, simParam, **kwargs)
+    sp = simParam or sim_param
+    st = kwargs.get("select_top", kwargs.get("selectTop", selectTop))
+    kwargs_clean = {k: v for k, v in kwargs.items() if k not in ("select_top", "selectTop")}
+    return select_ind(pop, nInd, trait, use, sex, st, returnPop, candidates, sp, **kwargs_clean)
 
 
 # Crossing functions
@@ -2582,290 +2472,347 @@ def rand_cross(pop: Pop, n_crosses: int, n_progeny: int = 1,
     return progeny_pop
 
 
-def randCross(pop: Pop, nCrosses: int, nProgeny: int = 1, balance: bool = True,
+def randCross(pop: Pop, nCrosses: int = None, nProgeny: int = 1, balance: bool = True,
               parents: Optional[List[int]] = None, ignoreSexes: bool = False,
-              simParam: Optional[SimParam] = None) -> Pop:
+              simParam: Optional[SimParam] = None, n_crosses: int = None, n_progeny: int = None,
+              sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
     """Convenience function with AlphaSimR-style parameter names"""
-    return rand_cross(pop, nCrosses, nProgeny, balance, parents, ignoreSexes, simParam)
+    nc = nCrosses if n_crosses is None else n_crosses
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return rand_cross(pop, nc, np_, balance, parents, ignoreSexes, sp)
 
 
-def make_cross2(females: Pop, males: Pop, cross_plan: np.ndarray,
-                sim_param: Optional[SimParam] = None) -> Pop:
-    """
-    Make crosses between two populations using a cross plan
-    
-    Parameters:
-    -----------
-    females : Pop
-        Female population
-    males : Pop
-        Male population
-    cross_plan : numpy.ndarray
-        Matrix with two columns representing female and male parent indices
-    sim_param : SimParam, optional
-        Simulation parameters
-    
-    Returns:
-    --------
-    Pop
-        New population of progeny
-    """
-    if sim_param is None:
-        raise ValueError("simParam must be provided")
-    
-    if females.ploidy % 2 != 0 or males.ploidy % 2 != 0:
-        raise ValueError("You can not cross individuals with odd ploidy levels")
-    
-    n_crosses = cross_plan.shape[0]
-    if cross_plan.shape[1] != 2:
-        raise ValueError("crossPlan must have 2 columns")
-    
-    # Validate cross plan indices
-    if np.max(cross_plan[:, 0]) >= females.n_ind or np.min(cross_plan[:, 0]) < 0:
-        raise ValueError("Invalid crossPlan: female indices out of range")
-    if np.max(cross_plan[:, 1]) >= males.n_ind or np.min(cross_plan[:, 1]) < 0:
-        raise ValueError("Invalid crossPlan: male indices out of range")
-    
-    # Generate progeny genotypes
-    total_progeny = n_crosses
+def _do_crosses(females: Pop, males: Pop, cross_plan: np.ndarray, n_progeny: int,
+                 sim_param: SimParam) -> Pop:
+    """Execute crosses from cross plan. Returns progeny Pop."""
+    total_progeny = len(cross_plan) * n_progeny
     progeny_geno = []
-    
     for chr_idx in range(females.n_chr):
         n_packed = females.geno[chr_idx].shape[0]
         chr_geno = np.zeros((n_packed, females.ploidy, total_progeny), dtype=np.uint8)
-        
-        for cross_idx in range(n_crosses):
-            female_idx = int(cross_plan[cross_idx, 0])
-            male_idx = int(cross_plan[cross_idx, 1])
-            
-            # Simple crossing simulation - randomly inherit from each parent
-            for packed_idx in range(n_packed):
-                for haplo in range(females.ploidy):
-                    if np.random.random() < 0.5:
-                        # Inherit from female
-                        chr_geno[packed_idx, haplo, cross_idx] = females.geno[chr_idx][packed_idx, haplo, female_idx]
+        for cross_idx, (f_idx, m_idx) in enumerate(cross_plan):
+            for prog_idx in range(n_progeny):
+                prog_global = cross_idx * n_progeny + prog_idx
+                for h in range(females.ploidy):
+                    if h % 2 == 0:
+                        hp = np.random.randint(0, females.ploidy)
+                        chr_geno[:, h, prog_global] = females.geno[chr_idx][:, hp, f_idx]
                     else:
-                        # Inherit from male
-                        chr_geno[packed_idx, haplo, cross_idx] = males.geno[chr_idx][packed_idx, haplo, male_idx]
-        
+                        hp = np.random.randint(0, males.ploidy)
+                        chr_geno[:, h, prog_global] = males.geno[chr_idx][:, hp, m_idx]
         progeny_geno.append(chr_geno)
-    
-    # Create progeny population
-    female_parents = [females.id[int(cross_plan[i, 0])] for i in range(n_crosses)]
-    male_parents = [males.id[int(cross_plan[i, 1])] for i in range(n_crosses)]
-    
     progeny_pop = Pop(
         n_ind=total_progeny, n_chr=females.n_chr, ploidy=females.ploidy, n_loci=females.n_loci,
         geno=progeny_geno, gen_map=females.gen_map, centromere=females.centromere,
-        inbred=False,  # Hybrids are not inbred
-        id=[f"{female_parents[i]}_{male_parents[i]}" for i in range(total_progeny)],
+        inbred=females.inbred,
+        id=[f"P{i+1}" for i in range(total_progeny)],
         iid=list(range(sim_param._last_id + 1, sim_param._last_id + total_progeny + 1)),
-        mother=female_parents,
-        father=male_parents,
-        sex=["H"] * total_progeny,
-        n_traits=females.n_traits,
+        mother=[females.id[f] for f, _ in cross_plan for _ in range(n_progeny)],
+        father=[males.id[m] for _, m in cross_plan for _ in range(n_progeny)],
+        sex=["H"] * total_progeny, n_traits=females.n_traits,
         gv=np.zeros((total_progeny, females.n_traits)),
         pheno=np.zeros((total_progeny, females.n_traits)),
-        ebv=np.empty((total_progeny, 0)),
-        gxe=[None] * females.n_traits,
-        fix_eff=[1] * total_progeny,
-        misc={},
-        misc_pop={}
+        ebv=np.empty((total_progeny, 0)), gxe=[None] * females.n_traits,
+        fix_eff=[1] * total_progeny, misc={}, misc_pop={}
     )
-    
-    # Calculate genetic values for progeny
     if females.n_traits > 0:
         progeny_pop.gv = _get_gv_index(progeny_pop, sim_param)
         progeny_pop.pheno = progeny_pop.gv.copy()
-    
-    # Update last ID
     sim_param._last_id += total_progeny
-    
     return progeny_pop
 
 
-def calc_coef(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
-    """
-    Calculate coefficients by solving X * coef = Y
-    Equivalent to AlphaSimR's calcCoef function
-    
-    Parameters:
-    -----------
-    X : numpy.ndarray
-        Design matrix
-    Y : numpy.ndarray
-        Response matrix
-    
-    Returns:
-    --------
-    numpy.ndarray
-        Coefficient matrix
-    """
-    # Use least squares if system is overdetermined or singular
-    try:
-        return np.linalg.solve(X, Y)
-    except np.linalg.LinAlgError:
-        # Use least squares if solve fails
-        return np.linalg.lstsq(X, Y, rcond=None)[0]
-
-
-def _get_hybrid_gv(females: Pop, female_parents: np.ndarray,
-                   males: Pop, male_parents: np.ndarray,
-                   sim_param: SimParam) -> tuple:
-    """
-    Calculate hybrid genetic values
-    
-    Parameters:
-    -----------
-    females : Pop
-        Female population
-    female_parents : numpy.ndarray
-        Indices of female parents
-    males : Pop
-        Male population
-    male_parents : numpy.ndarray
-        Indices of male parents
-    sim_param : SimParam
-        Simulation parameters
-    
-    Returns:
-    --------
-    tuple
-        (gv, gxe) where gv is genetic values and gxe is GxE slopes (if applicable)
-    """
-    n_hybrids = len(female_parents)
-    n_traits = sim_param.n_traits
-    
-    if n_traits == 0:
-        return (np.array([]), [])
-    
-    # Create temporary hybrid population once for all traits
-    # In a full implementation, this would use the C++ getHybridGv function
-    # For now, we'll approximate by creating actual crosses
-    temp_cross_plan = np.column_stack([female_parents, male_parents])
-    temp_hybrids = make_cross2(females, males, temp_cross_plan, sim_param)
-    
-    gv = temp_hybrids.gv
-    gxe = [None] * n_traits
-    
-    return (gv, gxe)
-
-
-def hybrid_cross(females: Pop, males: Pop,
-                cross_plan: Union[str, np.ndarray] = "testcross",
-                return_hybrid_pop: bool = False,
-                sim_param: Optional[SimParam] = None) -> Union[Pop, HybridPop]:
-    """
-    Hybrid crossing function for plant breeding simulations
-    
-    Parameters:
-    -----------
-    females : Pop
-        Female population
-    males : Pop
-        Male population
-    cross_plan : str or numpy.ndarray, default="testcross"
-        Either "testcross" for all possible combinations or a matrix with two columns
-    return_hybrid_pop : bool, default=False
-        Should results be returned as HybridPop. If False returns as Pop.
-    sim_param : SimParam, optional
-        Simulation parameters
-    
-    Returns:
-    --------
-    Pop or HybridPop
-        New population of hybrids
-    """
+def make_cross(pop: Pop, cross_plan: np.ndarray, n_progeny: int = 1,
+               sim_param: Optional[SimParam] = None) -> Pop:
+    """Make designed crosses. From AlphaSimR crossing.R makeCross."""
     if sim_param is None:
         raise ValueError("simParam must be provided")
-    
-    if females.ploidy % 2 != 0 or males.ploidy % 2 != 0:
-        raise ValueError("You can not cross individuals with odd ploidy levels")
-    
-    # Handle cross plan
-    if isinstance(cross_plan, str):
-        if cross_plan == "testcross":
-            # Create all possible combinations
-            cross_plan = np.array([[i, j] for i in range(females.n_ind) 
-                                   for j in range(males.n_ind)])
-        else:
-            raise ValueError(f"crossPlan={cross_plan} is not a valid option")
-    elif isinstance(cross_plan, np.ndarray):
-        # Use provided cross plan
-        pass
+    cross_plan = np.asarray(cross_plan)
+    if cross_plan.dtype.kind in ('U', 'S', 'O'):
+        def _lookup(s, id_list, n_ind):
+            s = str(s)
+            try:
+                idx = int(s)
+                if 0 <= idx < n_ind:
+                    return idx
+            except (ValueError, TypeError):
+                pass
+            try:
+                return id_list.index(s)
+            except ValueError:
+                raise ValueError(f"'{s}' is not in list")
+        f_idx = np.array([_lookup(r[0], pop.id, pop.n_ind) for r in cross_plan])
+        m_idx = np.array([_lookup(r[1], pop.id, pop.n_ind) for r in cross_plan])
+        cross_plan = np.column_stack([f_idx, m_idx])
     else:
-        raise ValueError("crossPlan must be 'testcross' or a numpy array")
-    
-    # Set IDs
-    female_parents = [females.id[int(cross_plan[i, 0])] for i in range(cross_plan.shape[0])]
-    male_parents = [males.id[int(cross_plan[i, 1])] for i in range(cross_plan.shape[0])]
-    id_list = [f"{female_parents[i]}_{male_parents[i]}" for i in range(len(female_parents))]
-    
-    # Return Pop-class
-    if not return_hybrid_pop:
-        return make_cross2(females, males, cross_plan, sim_param)
-    
-    # Return HybridPop-class
-    n_hybrids = len(id_list)
-    n_traits = sim_param.n_traits
-    
-    gv = np.zeros((n_hybrids, n_traits))
-    gxe = [None] * n_traits
-    
-    # Calculate hybrid genetic values
-    if n_traits > 0:
-        female_parents_idx = cross_plan[:, 0].astype(int)
-        male_parents_idx = cross_plan[:, 1].astype(int)
-        gv_result, gxe_result = _get_hybrid_gv(females, female_parents_idx,
-                                               males, male_parents_idx,
-                                               sim_param)
-        gv = gv_result
-        gxe = gxe_result
-    
-    # Add error to get phenotypes
-    if n_traits > 0:
-        var_e = sim_param._var_e
-        if isinstance(var_e, np.ndarray) and var_e.ndim == 2:
-            # Covariance matrix
-            error = np.random.multivariate_normal(np.zeros(n_traits), var_e, n_hybrids)
-        else:
-            # Vector of variances
-            error = np.random.normal(0, np.sqrt(var_e), (n_hybrids, n_traits))
-        pheno = gv + error
+        cross_plan = cross_plan.astype(int)
+        if np.min(cross_plan) >= 1:
+            cross_plan = cross_plan - 1
+        if np.any(cross_plan < 0) or np.any(cross_plan >= pop.n_ind):
+            raise ValueError("Invalid crossPlan")
+    if n_progeny > 1:
+        cross_plan = np.repeat(cross_plan, n_progeny, axis=0)
+    return _do_crosses(pop, pop, cross_plan, 1, sim_param)
+
+
+def makeCross(pop, crossPlan=None, nProgeny=1, simParam=None, cross_plan=None, n_progeny=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    cp = crossPlan if cross_plan is None else cross_plan
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return make_cross(pop, cp, np_, sp)
+
+
+def make_cross2(females: Pop, males: Pop, cross_plan: np.ndarray, n_progeny: int = 1,
+                sim_param: Optional[SimParam] = None) -> Pop:
+    """Make crosses between two populations. From AlphaSimR crossing.R makeCross2."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    cross_plan = np.asarray(cross_plan)
+    if cross_plan.dtype.kind in ('U', 'S', 'O'):
+        def _lookup(s, id_list, n_ind):
+            s = str(s)
+            try:
+                idx = int(s)
+                if 0 <= idx < n_ind:
+                    return idx
+            except (ValueError, TypeError):
+                pass
+            try:
+                return id_list.index(s)
+            except ValueError:
+                raise ValueError(f"'{s}' is not in list")
+        f_idx = np.array([_lookup(r[0], females.id, females.n_ind) for r in cross_plan])
+        m_idx = np.array([_lookup(r[1], males.id, males.n_ind) for r in cross_plan])
+        cross_plan = np.column_stack([f_idx, m_idx])
     else:
-        pheno = gv
-    
-    output = HybridPop(
-        n_ind=n_hybrids,
-        id=id_list,
-        mother=female_parents,
-        father=male_parents,
-        n_traits=n_traits,
-        gv=gv,
-        pheno=pheno,
-        gxe=gxe
+        cross_plan = cross_plan.astype(int)
+        if np.min(cross_plan) >= 1:
+            cross_plan = cross_plan - 1
+        if np.any(cross_plan[:, 0] < 0) or np.any(cross_plan[:, 0] >= females.n_ind):
+            raise ValueError("Invalid crossPlan")
+        if np.any(cross_plan[:, 1] < 0) or np.any(cross_plan[:, 1] >= males.n_ind):
+            raise ValueError("Invalid crossPlan")
+    if n_progeny > 1:
+        cross_plan = np.repeat(cross_plan, n_progeny, axis=0)
+    return _do_crosses(females, males, cross_plan, 1, sim_param)
+
+
+def makeCross2(females, males, crossPlan=None, nProgeny=1, simParam=None, cross_plan=None, n_progeny=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    cp = crossPlan if cross_plan is None else cross_plan
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return make_cross2(females, males, cp, np_, sp)
+
+
+def rand_cross2(females: Pop, males: Pop, n_crosses: int, n_progeny: int = 1,
+                balance: bool = True, female_parents=None, male_parents=None,
+                ignore_sexes: bool = False, sim_param: Optional[SimParam] = None) -> Pop:
+    """Random crosses between two populations. From AlphaSimR crossing.R randCross2."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    female_parents = female_parents or list(range(females.n_ind))
+    male_parents = male_parents or list(range(males.n_ind))
+    if sim_param._sexes == "no" or ignore_sexes:
+        f_eligible = female_parents
+        m_eligible = male_parents
+    else:
+        f_eligible = [i for i in female_parents if females.sex[i] == "F"]
+        m_eligible = [i for i in male_parents if males.sex[i] == "M"]
+        if not f_eligible or not m_eligible:
+            raise ValueError("Need both female and male parents")
+    if balance:
+        f_eligible = list(np.random.permutation(f_eligible))
+        m_eligible = list(np.random.permutation(m_eligible))
+        f_eligible = (f_eligible * (n_crosses // len(f_eligible) + 1))[:n_crosses]
+        m_eligible = (m_eligible * (n_crosses // len(m_eligible) + 1))[:n_crosses]
+        cross_plan = np.column_stack([f_eligible, m_eligible])
+    else:
+        cross_plan = np.column_stack([
+            np.random.choice(f_eligible, n_crosses),
+            np.random.choice(m_eligible, n_crosses)
+        ])
+    return _do_crosses(females, males, cross_plan, n_progeny, sim_param)
+
+
+def randCross2(females, males, nCrosses=None, nProgeny=1, balance=True,
+               femaleParents=None, maleParents=None, ignoreSexes=False, simParam=None,
+               n_crosses=None, n_progeny=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    nc = nCrosses if n_crosses is None else n_crosses
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return rand_cross2(females, males, nc, np_, balance,
+                       femaleParents, maleParents, ignoreSexes, sp)
+
+
+def self_(pop: Pop, n_progeny: int = 1, parents=None, keep_parents: bool = True,
+          sim_param: Optional[SimParam] = None) -> Pop:
+    """Self individuals. From AlphaSimR crossing.R self."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    parents = parents or list(range(pop.n_ind))
+    parents = np.atleast_1d(parents).astype(int) - 1
+    cross_plan = np.column_stack([np.repeat(parents, n_progeny),
+                                  np.repeat(parents, n_progeny)])
+    return _do_crosses(pop, pop, cross_plan, 1, sim_param)
+
+
+def self(pop, nProgeny=1, parents=None, keepParents=True, simParam=None,
+         n_progeny=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names (self is Python keyword)"""
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return self_(pop, np_, parents, keepParents, sp)
+
+
+def make_dh(pop: Pop, n_dh: int = 1, use_female: bool = True, keep_parents: bool = True,
+            sim_param: Optional[SimParam] = None) -> Pop:
+    """Create doubled haploids. From AlphaSimR crossing.R makeDH."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    if pop.ploidy != 2:
+        raise ValueError("Only works with diploids")
+    result_pops = []
+    for ind_idx in range(pop.n_ind):
+        for _ in range(n_dh):
+            haplo_idx = 0 if np.random.random() < 0.5 else 1
+            progeny_geno = []
+            for chr_idx in range(pop.n_chr):
+                g = pop.geno[chr_idx][:, :, ind_idx]
+                dh_geno = np.stack([g[:, haplo_idx].copy(), g[:, haplo_idx].copy()], axis=1)
+                dh_geno = dh_geno.reshape(dh_geno.shape[0], 2, 1)
+                progeny_geno.append(dh_geno)
+            result_pops.append(progeny_geno)
+    total = pop.n_ind * n_dh
+    merged_geno = [np.concatenate([p[c] for p in result_pops], axis=2) for c in range(pop.n_chr)]
+    progeny_pop = Pop(
+        n_ind=total, n_chr=pop.n_chr, ploidy=2, n_loci=pop.n_loci,
+        geno=merged_geno, gen_map=pop.gen_map, centromere=pop.centromere,
+        inbred=True,
+        id=[f"P{i+1}" for i in range(total)],
+        iid=list(range(sim_param._last_id + 1, sim_param._last_id + total + 1)),
+        mother=[pop.mother[i] for i in range(pop.n_ind) for _ in range(n_dh)],
+        father=[pop.father[i] for i in range(pop.n_ind) for _ in range(n_dh)],
+        sex=["H"] * total, n_traits=pop.n_traits,
+        gv=np.zeros((total, pop.n_traits)), pheno=np.zeros((total, pop.n_traits)),
+        ebv=np.empty((total, 0)), gxe=[None] * pop.n_traits,
+        fix_eff=[1] * total, misc={}, misc_pop={}
     )
-    return output
+    if pop.n_traits > 0:
+        progeny_pop.gv = _get_gv_index(progeny_pop, sim_param)
+        progeny_pop.pheno = progeny_pop.gv.copy()
+    sim_param._last_id += total
+    return progeny_pop
 
 
-def calc_gca(pop: Union[Pop, HybridPop], use: str = "pheno") -> Dict[str, np.ndarray]:
-    """
-    Calculate general combining ability of test crosses
-    
-    Parameters:
-    -----------
-    pop : Pop or HybridPop
-        Population with hybrid crosses
-    use : str, default="pheno"
-        Tabulate either genetic values "gv", estimated breeding values "ebv", or phenotypes "pheno"
-    
-    Returns:
-    --------
-    dict
-        Dictionary with keys 'GCAf', 'GCAm', 'SCA' containing GCA for females, males, and SCA
-    """
-    use = use.lower()
-    
+def makeDH(pop, nDH=1, useFemale=True, keepParents=True, simParam=None, n_dh=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    nd = nDH if n_dh is None else n_dh
+    sp = simParam or sim_param
+    return make_dh(pop, nd, useFemale, keepParents, sp)
+
+
+def select_cross(pop: Pop, n_ind=None, n_female=None, n_male=None, n_crosses: int = 1,
+                n_progeny: int = 1, trait=1, use: str = "pheno", select_top: bool = True,
+                balance: bool = True, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
+    """Select and cross. From AlphaSimR crossing.R selectCross."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    if n_ind is not None:
+        parents = select_ind(pop, n_ind, trait, use, "B", select_top, False, sim_param=sim_param, **kwargs)
+        cross_plan = []
+        for _ in range(n_crosses):
+            p = np.random.choice(parents, 2, replace=False)
+            cross_plan.append(p + 1)
+        cross_plan = np.array(cross_plan)
+        return make_cross(pop, cross_plan, n_progeny, sim_param)
+    else:
+        if sim_param._sexes == "no":
+            raise ValueError("Must specify nInd when simParam sexes is 'no'")
+        females = select_ind(pop, n_female, trait, use, "F", select_top, True, sim_param=sim_param, **kwargs)
+        males = select_ind(pop, n_male, trait, use, "M", select_top, True, sim_param=sim_param, **kwargs)
+        return rand_cross2(females, males, n_crosses, n_progeny, balance, sim_param=sim_param)
+
+
+def selectCross(pop, nInd=None, nFemale=None, nMale=None, nCrosses=1, nProgeny=1,
+                trait=1, use="pheno", selectTop=True, balance=True, simParam=None,
+                n_ind=None, n_female=None, n_male=None, n_crosses=None, n_progeny=None, sim_param=None, **kwargs):
+    """Convenience function with AlphaSimR-style parameter names"""
+    ni = nInd if n_ind is None else n_ind
+    nf = nFemale if n_female is None else n_female
+    nm = nMale if n_male is None else n_male
+    nc = nCrosses if n_crosses is None else n_crosses
+    np_ = nProgeny if n_progeny is None else n_progeny
+    sp = simParam or sim_param
+    return select_cross(pop, ni, nf, nm, nc, np_,
+                        trait, use, selectTop, balance, sp, **kwargs)
+
+
+def select_op(pop: Pop, n_ind: int, n_seeds: int, prob_self: float = 0,
+              pollen_control: bool = False, trait=1, use: str = "pheno",
+              select_top: bool = True, candidates=None, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
+    """Open pollination. From AlphaSimR selection.R selectOP."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    female = select_ind(pop, n_ind, trait, use, "B", select_top, False, candidates, sim_param, **kwargs)
+    n_self = np.random.binomial(n_seeds, prob_self, n_ind)
+    cross_plan = []
+    for i, f in enumerate(female):
+        males = [j for j in range(pop.n_ind) if j != f] if not pollen_control else [f]
+        n_outcross = n_seeds - n_self[i]
+        male_part = np.concatenate([
+            np.repeat(f, n_self[i]),
+            np.random.choice(males, n_outcross) if males and n_outcross > 0 else np.array([], dtype=int)
+        ])
+        if len(male_part) < n_seeds:
+            male_part = np.concatenate([male_part, np.random.choice(males or [f], n_seeds - len(male_part))])
+        female_part = np.repeat(f + 1, n_seeds)
+        male_part = male_part + 1
+        cross_plan.append(np.column_stack([female_part, male_part]))
+    cross_plan = np.vstack(cross_plan)
+    return make_cross(pop, cross_plan, 1, sim_param)
+
+
+def selectOP(pop, nInd=None, nSeeds=None, probSelf=0, pollenControl=False, trait=1,
+            use="pheno", selectTop=True, candidates=None, simParam=None,
+            n_ind=None, n_seeds=None, sim_param=None, **kwargs):
+    """Convenience function with AlphaSimR-style parameter names"""
+    ni = nInd if n_ind is None else n_ind
+    ns = nSeeds if n_seeds is None else n_seeds
+    sp = simParam or sim_param
+    return select_op(pop, ni, ns, probSelf, pollenControl, trait, use,
+                     selectTop, candidates, sp, **kwargs)
+
+
+def hybrid_cross(females: Pop, males: Pop, cross_plan: str = "testcross",
+                 return_hybrid_pop: bool = False,
+                 sim_param: Optional[SimParam] = None) -> Pop:
+    """Hybrid crossing - all combinations. From AlphaSimR hybrids.R hybridCross."""
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    if cross_plan == "testcross":
+        cross_plan = np.column_stack([
+            np.repeat(np.arange(females.n_ind), males.n_ind),
+            np.tile(np.arange(males.n_ind), females.n_ind)
+        ])
+        if np.min(cross_plan) >= 1:
+            cross_plan = cross_plan + 1
+    return make_cross2(females, males, cross_plan, 1, sim_param)
+
+
+def hybridCross(females, males, crossPlan="testcross", returnHybridPop=False, simParam=None,
+                return_hybrid_pop=None, sim_param=None):
+    """Convenience function with AlphaSimR-style parameter names"""
+    rhp = returnHybridPop if return_hybrid_pop is None else return_hybrid_pop
+    sp = simParam or sim_param
+    return hybrid_cross(females, males, crossPlan, rhp, sp)
+
+
+def calc_gca(pop: Pop, use: str = "pheno") -> dict:
+    """Calculate GCA from hybrid pop. From AlphaSimR hybrids.R calcGCA."""
     if use == "pheno":
         y = pop.pheno
     elif use == "gv":
@@ -2874,681 +2821,37 @@ def calc_gca(pop: Union[Pop, HybridPop], use: str = "pheno") -> Dict[str, np.nda
         y = pop.ebv
     else:
         raise ValueError(f"use={use} is not a valid option")
-    
     if y.shape[1] == 0:
         raise ValueError(f"No values for {use}")
-    
-    # Convert to factors
     female = pop.mother
     male = pop.father
-    
-    unique_females = list(dict.fromkeys(female))  # Preserve order
-    unique_males = list(dict.fromkeys(male))
-    
-    female_factor = [unique_females.index(f) for f in female]
-    male_factor = [unique_males.index(m) for m in male]
-    
-    n_females = len(unique_females)
-    n_males = len(unique_males)
-    n_traits = y.shape[1]
-    
-    # Check for balance
-    if n_females == 1 or n_males == 1:
-        balanced = True
-    else:
-        # Check if balanced design
-        counts = {}
-        for f, m in zip(female_factor, male_factor):
-            counts[(f, m)] = counts.get((f, m), 0) + 1
-        balanced = len(set(counts.values())) == 1
-    
-    # Calculate SCA combinations
-    sca_combos = [f"{f}_{m}" for f, m in zip(female, male)]
-    unique_sca = list(dict.fromkeys(sca_combos))
-    sca_factor = [unique_sca.index(s) for s in sca_combos]
-    n_sca = len(unique_sca)
-    
-    # Female GCA
-    if n_females == 1:
-        GCAf = np.tile(np.mean(y, axis=0), (1, 1))
-    else:
-        if n_males == 1:
-            GCAf = y
-        else:
-            if balanced:
-                # Calculate simple means
-                GCAf = np.zeros((n_females, n_traits))
-                for i, f in enumerate(unique_females):
-                    mask = np.array([j == i for j in female_factor])
-                    GCAf[i, :] = np.mean(y[mask, :], axis=0)
-            else:
-                # Calculate population marginal means using linear model
-                # Create design matrix: ~female+male-1 with sum contrasts for male
-                # In sum contrasts, the last level is represented as -1 in all other columns
-                X = np.zeros((len(female), n_females + n_males - 1))
-                for i, (f_idx, m_idx) in enumerate(zip(female_factor, male_factor)):
-                    X[i, f_idx] = 1
-                    if m_idx < n_males - 1:
-                        X[i, n_females + m_idx] = 1
-                    else:
-                        # Last male level: set all male columns to -1
-                        X[i, n_females:n_females + n_males - 1] = -1
-                
-                coef = calc_coef(X.T @ X, X.T @ y)
-                GCAf = coef[:n_females, :]
-    
-    GCAf_df = np.column_stack([np.array(unique_females).reshape(-1, 1), GCAf])
-    
-    # Male GCA
-    if n_males == 1:
-        GCAm = np.tile(np.mean(y, axis=0), (1, 1))
-    else:
-        if n_females == 1:
-            GCAm = y
-        else:
-            if balanced:
-                # Calculate simple means
-                GCAm = np.zeros((n_males, n_traits))
-                for i, m in enumerate(unique_males):
-                    mask = np.array([j == i for j in male_factor])
-                    GCAm[i, :] = np.mean(y[mask, :], axis=0)
-            else:
-                # Calculate population marginal means using linear model
-                # Create design matrix: ~male+female-1 with sum contrasts for female
-                # In sum contrasts, the last level is represented as -1 in all other columns
-                X = np.zeros((len(male), n_males + n_females - 1))
-                for i, (m_idx, f_idx) in enumerate(zip(male_factor, female_factor)):
-                    X[i, m_idx] = 1
-                    if f_idx < n_females - 1:
-                        X[i, n_males + f_idx] = 1
-                    else:
-                        # Last female level: set all female columns to -1
-                        X[i, n_males:n_males + n_females - 1] = -1
-                
-                coef = calc_coef(X.T @ X, X.T @ y)
-                GCAm = coef[:n_males, :]
-    
-    GCAm_df = np.column_stack([np.array(unique_males).reshape(-1, 1), GCAm])
-    
-    # SCA
-    if n_sca == pop.n_ind:
-        SCA = y
-    else:
-        # Calculate simple means
-        SCA = np.zeros((n_sca, n_traits))
-        for i, sca_combo in enumerate(unique_sca):
-            mask = np.array([j == i for j in sca_factor])
-            SCA[i, :] = np.mean(y[mask, :], axis=0)
-    
-    SCA_df = np.column_stack([np.array(unique_sca).reshape(-1, 1), SCA])
-    
-    return {
-        'GCAf': GCAf_df,
-        'GCAm': GCAm_df,
-        'SCA': SCA_df
-    }
+    female_ids = list(dict.fromkeys(female))
+    male_ids = list(dict.fromkeys(male))
+    n_f = len(female_ids)
+    n_m = len(male_ids)
+    f_idx = np.array([female_ids.index(f) for f in female])
+    m_idx = np.array([male_ids.index(m) for m in male])
+    y_mean = np.mean(y, axis=1)
+    if y_mean.ndim == 1:
+        y_mean = y_mean.reshape(-1, 1)
+    n_traits = y_mean.shape[1]
+    n_hyb = len(female)
+    GCAf = np.zeros((n_f, n_traits))
+    GCAm = np.zeros((n_m, n_traits))
+    SCA = np.zeros((n_hyb, n_traits))
+    for t in range(n_traits):
+        grand_mean = np.mean(y_mean[:, t])
+        for i in range(n_f):
+            mask = f_idx == i
+            GCAf[i, t] = np.mean(y_mean[mask, t]) - grand_mean
+        for j in range(n_m):
+            mask = m_idx == j
+            GCAm[j, t] = np.mean(y_mean[mask, t]) - grand_mean
+        for k in range(n_hyb):
+            SCA[k, t] = y_mean[k, t] - grand_mean - GCAf[f_idx[k], t] - GCAm[m_idx[k], t]
+    return {'GCAf': GCAf, 'GCAm': GCAm, 'SCA': SCA}
 
 
-def set_pheno_gca(pop: Pop, testers: Pop, use: str = "pheno",
-                  h2: Optional[Union[float, List[float]]] = None,
-                  H2: Optional[Union[float, List[float]]] = None,
-                  var_e: Optional[Union[float, List[float], np.ndarray]] = None,
-                  cor_e: Optional[np.ndarray] = None,
-                  reps: int = 1, fix_eff: int = 1, p: Optional[float] = None,
-                  inbred: bool = False, only_pheno: bool = False,
-                  sim_param: Optional[SimParam] = None) -> Union[Pop, np.ndarray]:
-    """
-    Set phenotypes using general combining ability
-    
-    Parameters:
-    -----------
-    pop : Pop
-        Population to set phenotypes for
-    testers : Pop
-        Tester population
-    use : str, default="pheno"
-        True genetic value ("gv") or phenotypes ("pheno")
-    h2 : float or list of float, optional
-        Narrow-sense heritabilities
-    H2 : float or list of float, optional
-        Broad-sense heritabilities
-    var_e : float, list of float, or numpy.ndarray, optional
-        Error variances
-    cor_e : numpy.ndarray, optional
-        Error correlation matrix
-    reps : int, default=1
-        Number of replications
-    fix_eff : int, default=1
-        Fixed effect to assign
-    p : float, optional
-        p-value for environmental covariate (GxE traits)
-    inbred : bool, default=False
-        Are both pop and testers fully inbred
-    only_pheno : bool, default=False
-        Should only phenotype be returned
-    sim_param : SimParam, optional
-        Simulation parameters
-    
-    Returns:
-    --------
-    Pop or numpy.ndarray
-        Population with updated phenotypes or phenotype matrix if only_pheno=True
-    """
-    if sim_param is None:
-        raise ValueError("simParam must be provided")
-    
-    if any(pop.id[i] in pop.id[i+1:] for i in range(len(pop.id))):
-        raise ValueError("This function does not work with duplicate IDs")
-    
-    use = use.lower()
-    
-    # Make hybrids
-    tmp = hybrid_cross(females=pop, males=testers, cross_plan="testcross",
-                      return_hybrid_pop=inbred, sim_param=sim_param)
-    
-    # Get response
-    if use == "pheno":
-        if isinstance(tmp, HybridPop):
-            # HybridPop already has phenotypes calculated
-            y = tmp.pheno
-        else:
-            # For Pop, need to set phenotypes
-            # Note: set_pheno doesn't currently support h2/H2/corE, so we'll use var_e if provided
-            if var_e is not None:
-                tmp = set_pheno(tmp, var_e=var_e, reps=reps, sim_param=sim_param)
-            else:
-                tmp = set_pheno(tmp, reps=reps, sim_param=sim_param)
-            y = tmp.pheno
-    elif use == "gv":
-        y = tmp.gv
-    else:
-        raise ValueError(f"use={use} is not a valid option")
-    
-    if y.shape[1] == 0:
-        raise ValueError(f"No values for {use}")
-    
-    # Calculate GCA for females
-    female = tmp.mother
-    unique_females = list(dict.fromkeys(female))
-    
-    if len(unique_females) == 1:
-        GCAf = np.tile(np.mean(y, axis=0), (1, 1))
-    else:
-        if testers.n_ind == 1:
-            GCAf = y
-        else:
-            # Calculate simple means
-            female_factor = [unique_females.index(f) for f in female]
-            n_females = len(unique_females)
-            GCAf = np.zeros((n_females, y.shape[1]))
-            for i, f in enumerate(unique_females):
-                mask = np.array([j == i for j in female_factor])
-                GCAf[i, :] = np.mean(y[mask, :], axis=0)
-    
-    if only_pheno:
-        return GCAf
-    
-    pop.pheno = GCAf
-    pop.fix_eff = [fix_eff] * pop.n_ind
-    return pop
-
-
-# Convenience functions with AlphaSimR-style names
-def hybridCross(females: Pop, males: Pop,
-                crossPlan: Union[str, np.ndarray] = "testcross",
-                returnHybridPop: bool = False,
-                simParam: Optional[SimParam] = None) -> Union[Pop, HybridPop]:
-    """Convenience function with AlphaSimR-style parameter names"""
-    return hybrid_cross(females, males, crossPlan, returnHybridPop, simParam)
-
-
-def calcGCA(pop: Union[Pop, HybridPop], use: str = "pheno") -> Dict[str, np.ndarray]:
+def calcGCA(pop, use="pheno"):
     """Convenience function with AlphaSimR-style parameter names"""
     return calc_gca(pop, use)
-
-
-def setPhenoGCA(pop: Pop, testers: Pop, use: str = "pheno",
-                h2: Optional[Union[float, List[float]]] = None,
-                H2: Optional[Union[float, List[float]]] = None,
-                varE: Optional[Union[float, List[float], np.ndarray]] = None,
-                corE: Optional[np.ndarray] = None,
-                reps: int = 1, fixEff: int = 1, p: Optional[float] = None,
-                inbred: bool = False, onlyPheno: bool = False,
-                simParam: Optional[SimParam] = None) -> Union[Pop, np.ndarray]:
-    """Convenience function with AlphaSimR-style parameter names"""
-    return set_pheno_gca(pop, testers, use, h2, H2, varE, corE, reps, fixEff, p, inbred, onlyPheno, simParam)
-
-
-def self_pop(pop: Pop, n_progeny: int = 1,
-             parents: Optional[List[int]] = None,
-             keep_parents: bool = True,
-             sim_param: Optional[SimParam] = None) -> Pop:
-    """
-    Create selfed progeny from each individual in a population.
-    Mirrors AlphaSimR::self behavior for single-population objects.
-    """
-    if sim_param is None:
-        raise ValueError("simParam must be provided")
-
-    if pop.ploidy % 2 != 0:
-        raise ValueError("You can not self aneuploids")
-
-    n_ind = pop.n_ind
-    if parents is None:
-        parent_idx = list(range(n_ind))
-    else:
-        parent_idx = [int(i) for i in parents]
-
-    # Build cross plan: each selected individual selfed n_progeny times
-    cross_plan = []
-    for p in parent_idx:
-        for _ in range(n_progeny):
-            cross_plan.append((p, p))
-
-    total_progeny = len(cross_plan)
-
-    progeny_geno = []
-    for chr_idx in range(pop.n_chr):
-        n_packed = pop.geno[chr_idx].shape[0]
-        chr_geno = np.zeros((n_packed, pop.ploidy, total_progeny), dtype=np.uint8)
-        for prog_idx, (mother_idx, father_idx) in enumerate(cross_plan):
-            for packed_idx in range(n_packed):
-                for haplo in range(pop.ploidy):
-                    # Randomly draw gametes from the two parental chromosome copies
-                    if np.random.random() < 0.5:
-                        chr_geno[packed_idx, haplo, prog_idx] = pop.geno[chr_idx][packed_idx, haplo, mother_idx]
-                    else:
-                        chr_geno[packed_idx, haplo, prog_idx] = pop.geno[chr_idx][packed_idx, haplo, father_idx]
-        progeny_geno.append(chr_geno)
-
-    # Parents for pedigree
-    if keep_parents:
-        mother = [pop.mother[p] for p, _ in cross_plan]
-        father = [pop.father[p] for _, p in cross_plan]
-    else:
-        mother = [pop.id[p] for p, _ in cross_plan]
-        father = [pop.id[p] for _, p in cross_plan]
-
-    iid = list(range(sim_param._last_id + 1, sim_param._last_id + total_progeny + 1))
-    ids = [str(i) for i in iid]
-
-    progeny_pop = Pop(
-        n_ind=total_progeny,
-        n_chr=pop.n_chr,
-        ploidy=pop.ploidy,
-        n_loci=pop.n_loci,
-        geno=progeny_geno,
-        gen_map=pop.gen_map,
-        centromere=pop.centromere,
-        inbred=pop.inbred,
-        id=ids,
-        iid=iid,
-        mother=mother,
-        father=father,
-        sex=["H"] * total_progeny,
-        n_traits=pop.n_traits,
-        gv=np.zeros((total_progeny, pop.n_traits)),
-        pheno=np.zeros((total_progeny, pop.n_traits)),
-        ebv=np.empty((total_progeny, 0)),
-        gxe=[None] * pop.n_traits,
-        fix_eff=[1] * total_progeny,
-        misc={},
-        misc_pop={}
-    )
-
-    if pop.n_traits > 0:
-        progeny_pop.gv = _get_gv_index(progeny_pop, sim_param)
-        progeny_pop.pheno = progeny_pop.gv.copy()
-
-    sim_param._last_id += total_progeny
-
-    return progeny_pop
-
-
-def self(pop: Pop, nProgeny: int = 1,
-         parents: Optional[List[int]] = None,
-         keepParents: bool = True,
-         simParam: Optional[SimParam] = None) -> Pop:
-    """AlphaSimR-style self() convenience function"""
-    return self_pop(pop, nProgeny, parents, keepParents, simParam)
-
-
-def select_within_fam(pop: Pop, n_ind: int,
-                      trait: Union[int, callable] = 1,
-                      use: Union[str, callable] = "pheno",
-                      sex: str = "B",
-                      fam_type: str = "B",
-                      select_top: bool = True,
-                      return_pop: bool = True,
-                      candidates: Optional[List[int]] = None,
-                      sim_param: Optional[SimParam] = None,
-                      **kwargs) -> Union[Pop, List[int]]:
-    """
-    Select a subset of individuals within each family.
-    Mirrors AlphaSimR::selectWithinFam behavior for single Pop objects.
-    """
-    if sim_param is None:
-        raise ValueError("simParam must be provided")
-
-    if n_ind < 0:
-        raise ValueError("nInd must be >= 0")
-
-    # Determine eligible individuals based on sex and optional candidates
-    eligible = []
-    for i in range(pop.n_ind):
-        if sim_param._sexes == "no" or sex == "B" or pop.sex[i] == sex:
-            eligible.append(i)
-
-    if candidates is not None:
-        eligible = [i for i in eligible if i in candidates]
-
-    # Determine families
-    fam_type = fam_type.upper()
-    if fam_type == "B":
-        families = [f"{pop.mother[i]}_{pop.father[i]}" for i in range(pop.n_ind)]
-    elif fam_type == "F":
-        families = pop.mother
-    elif fam_type == "M":
-        families = pop.father
-    else:
-        raise ValueError(f"famType={fam_type} is not a valid option")
-
-    # Get selection criterion values
-    if isinstance(use, str):
-        if use == "pheno":
-            values = pop.pheno[:, trait - 1] if isinstance(trait, int) else pop.pheno
-        elif use == "gv":
-            values = pop.gv[:, trait - 1] if isinstance(trait, int) else pop.gv
-        elif use == "ebv":
-            values = pop.ebv[:, trait - 1] if isinstance(trait, int) else pop.ebv
-        elif use == "rand":
-            values = np.random.random(pop.n_ind)
-        else:
-            raise ValueError(f"Unknown use criterion: {use}")
-    else:
-        values = use(pop, trait, **kwargs)
-
-    if callable(trait):
-        values = trait(values, **kwargs)
-
-    if hasattr(values, "ndim") and values.ndim > 1:
-        values = values.flatten()
-
-    warn = False
-    selected_indices: List[int] = []
-
-    unique_fams = sorted(set(families))
-    for fam in unique_fams:
-        # indices belonging to this family
-        fam_idx = [i for i, f in enumerate(families) if f == fam]
-        fam_idx = [i for i in fam_idx if i in eligible]
-        if not fam_idx:
-            continue
-        fam_vals = np.array([values[i] for i in fam_idx])
-        order = np.argsort(fam_vals)
-        if select_top:
-            order = order[::-1]
-        ordered_idx = [fam_idx[i] for i in order]
-        if len(ordered_idx) < n_ind:
-            warn = True
-            take = ordered_idx
-        else:
-            take = ordered_idx[:n_ind]
-        selected_indices.extend(take)
-
-    if warn:
-        # Mirror AlphaSimR behavior: warn but continue
-        import warnings
-        warnings.warn("One or more families are smaller than nInd")
-
-    if return_pop:
-        if not selected_indices:
-            return Pop(
-                n_ind=0,
-                n_chr=pop.n_chr,
-                ploidy=pop.ploidy,
-                n_loci=pop.n_loci,
-                geno=[],
-                gen_map=pop.gen_map,
-                centromere=pop.centromere,
-                inbred=pop.inbred,
-                id=[],
-                iid=[],
-                mother=[],
-                father=[],
-                sex=[],
-                n_traits=pop.n_traits,
-                gv=np.empty((0, pop.n_traits)),
-                pheno=np.empty((0, pop.n_traits)),
-                ebv=np.empty((0, 0)),
-                gxe=[],
-                fix_eff=[],
-                misc={},
-                misc_pop={}
-            )
-
-        return Pop(
-            n_ind=len(selected_indices),
-            n_chr=pop.n_chr,
-            ploidy=pop.ploidy,
-            n_loci=pop.n_loci,
-            geno=[pop.geno[chr_idx][:, :, selected_indices] for chr_idx in range(pop.n_chr)],
-            gen_map=pop.gen_map,
-            centromere=pop.centromere,
-            inbred=pop.inbred,
-            id=[pop.id[i] for i in selected_indices],
-            iid=[pop.iid[i] for i in selected_indices],
-            mother=[pop.mother[i] for i in selected_indices],
-            father=[pop.father[i] for i in selected_indices],
-            sex=[pop.sex[i] for i in selected_indices],
-            n_traits=pop.n_traits,
-            gv=pop.gv[selected_indices, :],
-            pheno=pop.pheno[selected_indices, :],
-            ebv=pop.ebv[selected_indices, :],
-            gxe=pop.gxe,
-            fix_eff=[pop.fix_eff[i] for i in selected_indices],
-            misc=pop.misc,
-            misc_pop=pop.misc_pop
-        )
-    else:
-        return selected_indices
-
-
-def selectWithinFam(pop: Pop, nInd: int,
-                    trait: Union[int, callable] = 1,
-                    use: Union[str, callable] = "pheno",
-                    sex: str = "B",
-                    famType: str = "B",
-                    selectTop: bool = True,
-                    returnPop: bool = True,
-                    candidates: Optional[List[int]] = None,
-                    simParam: Optional[SimParam] = None,
-                    **kwargs) -> Union[Pop, List[int]]:
-    """AlphaSimR-style selectWithinFam() convenience function"""
-    return select_within_fam(pop, nInd, trait, use, sex, famType,
-                             selectTop, returnPop, candidates, simParam, **kwargs)
-
-
-def make_dh(pop: Pop, n_dh: int = 1, use_female: bool = True,
-            keep_parents: bool = True, sim_param: Optional[SimParam] = None) -> Pop:
-    """
-    Creates DH lines from each individual in a population.
-    Only works with diploid individuals. For polyploids, use
-    reduceGenome and doubleGenome.
-    
-    Parameters:
-    -----------
-    pop : Pop
-        Population object
-    n_dh : int, default=1
-        Total number of DH lines per individual
-    use_female : bool, default=True
-        Should female recombination rates be used
-    keep_parents : bool, default=True
-        Should previous parents be used for mother and father
-    sim_param : SimParam, optional
-        Simulation parameters
-    
-    Returns:
-    --------
-    Pop
-        New population of DH lines
-    """
-    if sim_param is None:
-        raise ValueError("simParam must be provided")
-    
-    if pop.ploidy != 2:
-        raise ValueError("Only works with diploids")
-    
-    n_ind = pop.n_ind
-    total_dh = n_ind * n_dh
-    
-    # Select genetic map based on use_female
-    if use_female:
-        gen_map = sim_param._female_map
-    else:
-        if sim_param._male_map is None:
-            gen_map = sim_param._female_map  # Fallback to female map
-        else:
-            gen_map = sim_param._male_map
-    
-    # Create DH genotypes
-    dh_geno = []
-    for chr_idx in range(pop.n_chr):
-        n_packed = pop.geno[chr_idx].shape[0]
-        n_loci_chr = pop.n_loci[chr_idx]
-        chr_gen_map = gen_map[chr_idx]
-        gen_len = chr_gen_map[-1] if len(chr_gen_map) > 0 else 0.0
-        
-        chr_dh_geno = np.zeros((n_packed, 2, total_dh), dtype=np.uint8)
-        
-        # For each individual, create nDH gametes and double them
-        for ind_idx in range(n_ind):
-            for dh_idx in range(n_dh):
-                dh_global_idx = ind_idx * n_dh + dh_idx
-                
-                # Create a gamete through recombination simulation
-                # Sample crossover positions based on genetic map (simplified Poisson process)
-                # Using Kosambi mapping function parameter v from sim_param
-                v = sim_param.v
-                p = sim_param.p
-                
-                # Expected number of crossovers (simplified)
-                # For Kosambi: mean = gen_len, variance depends on v
-                # Simplified: sample crossovers as Poisson process
-                if gen_len > 0:
-                    # Sample crossover positions along genetic map
-                    n_crossovers = np.random.poisson(gen_len)
-                    if n_crossovers > 0:
-                        crossover_positions = np.sort(np.random.uniform(0, gen_len, n_crossovers))
-                        # Thin crossovers (keep 50% randomly)
-                        crossover_positions = crossover_positions[np.random.random(n_crossovers) > 0.5]
-                    else:
-                        crossover_positions = np.array([])
-                else:
-                    crossover_positions = np.array([])
-                
-                # Initialize gamete with first chromosome
-                gamete = pop.geno[chr_idx][:, 0, ind_idx].copy()
-                
-                # Apply crossovers: alternate between chromosomes at each crossover
-                if len(crossover_positions) > 0:
-                    # Start with chromosome 0, then alternate
-                    current_chr = 0
-                    prev_locus = 0
-                    
-                    for cross_pos in crossover_positions:
-                        # Find which locus this crossover is at
-                        cross_locus = np.searchsorted(chr_gen_map, cross_pos)
-                        cross_locus = min(cross_locus, n_loci_chr - 1)
-                        
-                        # Copy from current chromosome up to this crossover
-                        start_byte = prev_locus // 8
-                        end_byte = cross_locus // 8
-                        
-                        for byte_idx in range(start_byte, min(end_byte + 1, n_packed)):
-                            gamete[byte_idx] = pop.geno[chr_idx][byte_idx, current_chr, ind_idx]
-                        
-                        # Switch to other chromosome for next segment
-                        current_chr = 1 - current_chr
-                        prev_locus = cross_locus
-                    
-                    # Copy remaining from current chromosome
-                    start_byte = prev_locus // 8
-                    for byte_idx in range(start_byte, n_packed):
-                        gamete[byte_idx] = pop.geno[chr_idx][byte_idx, current_chr, ind_idx]
-                
-                # Double the gamete to create diploid DH (both copies identical)
-                chr_dh_geno[:, 0, dh_global_idx] = gamete
-                chr_dh_geno[:, 1, dh_global_idx] = gamete
-        
-        dh_geno.append(chr_dh_geno)
-    
-    # Create MapPop for DH lines
-    raw_pop = MapPop(
-        n_ind=total_dh,
-        n_chr=pop.n_chr,
-        ploidy=pop.ploidy,
-        n_loci=pop.n_loci,
-        geno=dh_geno,
-        gen_map=pop.gen_map,
-        centromere=pop.centromere,
-        inbred=True  # DH lines are inbred
-    )
-    
-    # Set parent information
-    if keep_parents:
-        mother = [pop.mother[i] for i in range(n_ind) for _ in range(n_dh)]
-        father = [pop.father[i] for i in range(n_ind) for _ in range(n_dh)]
-        i_mother = [pop.iid[i] for i in range(n_ind) for _ in range(n_dh)]
-        i_father = [pop.iid[i] for i in range(n_ind) for _ in range(n_dh)]
-    else:
-        mother = [pop.id[i] for i in range(n_ind) for _ in range(n_dh)]
-        father = [pop.id[i] for i in range(n_ind) for _ in range(n_dh)]
-        i_mother = [pop.iid[i] for i in range(n_ind) for _ in range(n_dh)]
-        i_father = [pop.iid[i] for i in range(n_ind) for _ in range(n_dh)]
-    
-    # Generate IDs for DH lines
-    iid = list(range(sim_param._last_id + 1, sim_param._last_id + total_dh + 1))
-    id_list = [str(i) for i in iid]
-    
-    # Create Pop object
-    dh_pop = Pop(
-        n_ind=total_dh,
-        n_chr=pop.n_chr,
-        ploidy=pop.ploidy,
-        n_loci=pop.n_loci,
-        geno=dh_geno,
-        gen_map=pop.gen_map,
-        centromere=pop.centromere,
-        inbred=True,
-        id=id_list,
-        iid=iid,
-        mother=mother,
-        father=father,
-        sex=["H"] * total_dh,
-        n_traits=pop.n_traits,
-        gv=np.zeros((total_dh, pop.n_traits)),
-        pheno=np.zeros((total_dh, pop.n_traits)),
-        ebv=np.empty((total_dh, 0)),
-        gxe=[None] * pop.n_traits,
-        fix_eff=[1] * total_dh,
-        misc={},
-        misc_pop={}
-    )
-    
-    # Calculate genetic values for DH lines
-    if pop.n_traits > 0:
-        dh_pop.gv = _get_gv_index(raw_pop, sim_param)
-        dh_pop.pheno = dh_pop.gv.copy()
-    
-    # Update last ID
-    sim_param._last_id += total_dh
-    
-    return dh_pop
-
-
-def makeDH(pop: Pop, nDH: int = 1, useFemale: bool = True,
-           keepParents: bool = True, simParam: Optional[SimParam] = None) -> Pop:
-    """AlphaSimR-style makeDH() convenience function"""
-    return make_dh(pop, nDH, useFemale, keepParents, simParam)
