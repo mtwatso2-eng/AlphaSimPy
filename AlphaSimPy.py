@@ -6,13 +6,13 @@ import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-# Try to import C++ bindings, throw import error if not available
+# Try to import C++ bindings, fall back to Python implementation if not available
 try:
     import _alphasimpy_cpp
     _USE_CPP = True
 except ImportError:
     _USE_CPP = False
-    print("Error: C++ bindings not available.")
+    print("Warning: C++ bindings not available. Using Python implementation.")
     # Thread-local random number generator
     _thread_local = threading.local()
 
@@ -2348,6 +2348,138 @@ def selectInd(pop: Pop, nInd: int, trait: Union[int, callable] = 1,
     st = kwargs.get("select_top", kwargs.get("selectTop", selectTop))
     kwargs_clean = {k: v for k, v in kwargs.items() if k not in ("select_top", "selectTop")}
     return select_ind(pop, nInd, trait, use, sex, st, returnPop, candidates, sp, **kwargs_clean)
+
+
+def select_within_fam(
+    pop: Pop,
+    n_ind: int,
+    trait: Union[int, callable] = 1,
+    use: Union[str, callable] = "pheno",
+    sex: str = "B",
+    fam_type: str = "B",
+    select_top: bool = True,
+    return_pop: bool = True,
+    candidates: Optional[List[int]] = None,
+    sim_param: Optional[SimParam] = None,
+    **kwargs,
+) -> Union[Pop, List[int]]:
+    """
+    Select up to n_ind individuals within each full-sib or half-sib family.
+    From AlphaSimR selection.R selectWithinFam.
+    """
+    if sim_param is None:
+        raise ValueError("simParam must be provided")
+    if n_ind <= 0:
+        if return_pop:
+            return Pop(
+                n_ind=0, n_chr=pop.n_chr, ploidy=pop.ploidy, n_loci=pop.n_loci,
+                geno=[], gen_map=pop.gen_map, centromere=pop.centromere,
+                inbred=pop.inbred, id=[], iid=[], mother=[], father=[],
+                sex=[], n_traits=pop.n_traits, gv=np.empty((0, pop.n_traits)),
+                pheno=np.empty((0, pop.n_traits)), ebv=np.empty((0, 0)),
+                gxe=[], fix_eff=[], misc={}, misc_pop={}
+            )
+        return []
+
+    eligible = [i for i in range(pop.n_ind) if sex == "B" or pop.sex[i] == sex]
+    if candidates is not None:
+        eligible = [i for i in eligible if i in candidates]
+
+    def fam_key(i: int):
+        if fam_type == "B":
+            return (pop.mother[i], pop.father[i])
+        if fam_type == "F":
+            return pop.mother[i]
+        if fam_type == "M":
+            return pop.father[i]
+        raise ValueError(f"fam_type must be B, F, or M, got {fam_type}")
+
+    if isinstance(use, str):
+        if use == "pheno":
+            values = pop.pheno[:, trait - 1] if isinstance(trait, int) else pop.pheno
+        elif use == "gv":
+            values = pop.gv[:, trait - 1] if isinstance(trait, int) else pop.gv
+        elif use == "ebv":
+            values = pop.ebv[:, trait - 1] if isinstance(trait, int) else pop.ebv
+        elif use == "rand":
+            values = np.random.random(pop.n_ind)
+        else:
+            raise ValueError(f"Unknown use criterion: {use}")
+    else:
+        values = use(pop, trait, **kwargs)
+
+    if values.ndim > 1:
+        values = values.flatten()
+
+    if callable(trait):
+        values = trait(values, **kwargs)
+
+    from collections import defaultdict
+
+    fam_to_idx: Dict[Any, List[int]] = defaultdict(list)
+    for i in eligible:
+        fam_to_idx[fam_key(i)].append(i)
+
+    take: List[int] = []
+    for _fk, idxs in fam_to_idx.items():
+        sub = np.array(idxs)
+        v = values[sub]
+        order = np.argsort(v)
+        if select_top:
+            pick_order = order[::-1]
+        else:
+            pick_order = order
+        k = min(n_ind, len(pick_order))
+        take.extend(sub[pick_order[:k]].tolist())
+
+    take.sort()
+    if return_pop:
+        return Pop(
+            n_ind=len(take), n_chr=pop.n_chr, ploidy=pop.ploidy, n_loci=pop.n_loci,
+            geno=[pop.geno[chr_idx][:, :, take] for chr_idx in range(pop.n_chr)],
+            gen_map=pop.gen_map, centromere=pop.centromere, inbred=pop.inbred,
+            id=[pop.id[i] for i in take],
+            iid=[pop.iid[i] for i in take],
+            mother=[pop.mother[i] for i in take],
+            father=[pop.father[i] for i in take],
+            sex=[pop.sex[i] for i in take],
+            n_traits=pop.n_traits, gv=pop.gv[take, :],
+            pheno=pop.pheno[take, :], ebv=pop.ebv[take, :],
+            gxe=pop.gxe, fix_eff=[pop.fix_eff[i] for i in take],
+            misc=pop.misc, misc_pop=pop.misc_pop
+        )
+    return take
+
+
+def selectWithinFam(
+    pop: Pop,
+    nInd: int,
+    trait: Union[int, callable] = 1,
+    use: str = "pheno",
+    sex: str = "B",
+    famType: str = "B",
+    selectTop: bool = True,
+    returnPop: bool = True,
+    candidates: Optional[List[int]] = None,
+    simParam: Optional[SimParam] = None,
+    sim_param: Optional[SimParam] = None,
+    **kwargs,
+) -> Union[Pop, List[int]]:
+    """AlphaSimR-style names for select_within_fam."""
+    sp = simParam or sim_param
+    return select_within_fam(
+        pop,
+        nInd,
+        trait,
+        use,
+        sex,
+        famType,
+        selectTop,
+        returnPop,
+        candidates,
+        sp,
+        **kwargs,
+    )
 
 
 # Crossing functions
