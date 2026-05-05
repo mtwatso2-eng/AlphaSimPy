@@ -1,210 +1,153 @@
 # AlphaSimPy
 
-A pure Python clone of AlphaSimR's `runMacs()` function with simplified simulation logic.
+Python breeding simulation aligned with [AlphaSimR](https://github.com/gaynorr/AlphaSimR). The package builds an optional **C++ extension** (pybind11 + AlphaSimR-derived sources under `src/alphasimr_cpp/`) for faster coalescent-style founder generation and related paths. If the extension is missing, many routines **fall back to pure Python** (you will see a one-time import warning).
 
-## Features
+## Requirements
 
-- **Same interface**: Implements the same `runMacs()` function as AlphaSimR
-- **Pure Python**: No external C++ dependencies required
-- **All species models**: Supports GENERIC, CATTLE, WHEAT, and MAIZE species histories
-- **Parallel processing**: Uses Python threading for parallel simulation
-- **Pythonic interface**: Clean Python API with type hints and documentation
+| | |
+|---|---|
+| **Python** | 3.9+ (see `pyproject.toml`) |
+| **Runtime** | `numpy`, `pybind11` |
+| **Build (extension)** | C++14-capable toolchain, **Boost headers**, **Armadillo** (headers + linked library) |
 
-## Note
+Bundled C++ sources live in `src/alphasimr_cpp/`. You do **not** need a separate AlphaSimR checkout unless you override the source path (see below).
 
-This implementation provides the same interface and functionality as AlphaSimR's `runMacs()` function, but uses a pure Python implementation with simplified simulation logic. The simulation replicates the core MaCS functionality with the same parameter handling and output format, making it easy to use without complex build requirements.
+## Quick install (from a clone)
 
-## Installation
+### 1. System libraries
 
-### Simple Installation
+**macOS** (recommended):
 
-1. Clone or download this repository
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. That's it! No compilation required.
-
-### Dependencies
-
-- Python 3.6+
-- NumPy
-- No external C++ libraries required
-
-## Usage
-
-### Quick Test
-Run the minimal test notebook:
 ```bash
-jupyter notebook AlphaSimPy.ipynb
+xcode-select --install   # if you do not already have Command Line Tools
+brew install boost armadillo
 ```
 
-### Basic Usage
-```python
-from AlphaSimPy import run_macs, MapPop, SimParam
+**Ubuntu / Debian**:
 
-# Create a population of 10 outbred individuals
-# with 1 chromosome and 100 segregating sites
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential \
+  libboost-all-dev libarmadillo-dev
+```
+
+**Fedora-style**:
+
+```bash
+sudo dnf install gcc-c++ boost-devel armadillo-devel
+```
+
+If headers are installed in a non-standard location:
+
+```bash
+export BOOST_INCLUDE_DIR=/path/to/boost/parent       # directory containing boost/
+export ARMADILLO_INCLUDE_DIR=/path/to/include         # directory containing armadillo/
+```
+
+### 2. Python environment and package
+
+From the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -U pip setuptools wheel
+
+# editable install while developing (builds extension in-place)
+pip install -e .
+
+# optional: notebooks, plotting, etc.
+pip install -r requirements.txt
+```
+
+To force a fresh build of the extension after C++ changes:
+
+```bash
+pip install -e . --no-build-isolation --force-reinstall
+```
+
+### Advanced: alternate AlphaSimR C++ tree
+
+Only if you are **not** using the bundled `src/alphasimr_cpp`, point `setup.py` at another AlphaSimR C++ directory:
+
+```bash
+export ALPHASIMR_SRC=/absolute/path/to/AlphaSimR/src
+pip install -e .
+```
+
+If you invoke `setup.py` directly, you can instead pass **`--alphasimr-src=/path`**.
+
+Tagged releases may ship prebuilt wheels from `.github/workflows/wheels.yml` (Linux/macOS).
+
+## Smoke test
+
+```bash
+pytest -q
+```
+
+(`pyproject.toml` sets `pythonpath = ["src"]` for pytest when run from the repo root.)
+
+```python
+from alphasimpy import MapPop, SimParam, new_pop, run_macs
+
 founder_pop = run_macs(n_ind=10, n_chr=1, seg_sites=100)
-
-print(f"Number of individuals: {founder_pop.n_ind}")
-print(f"Number of chromosomes: {founder_pop.n_chr}")
-print(f"Ploidy: {founder_pop.ploidy}")
-print(f"Number of loci per chromosome: {founder_pop.n_loci}")
-print(f"Is inbred: {founder_pop.inbred}")
-
-# Set up simulation parameters
 SP = SimParam(founder_pop)
-
-# Add additive trait with 5 QTL per chromosome
 SP.addTraitA(5)
-
-# Add SNP chip with 10 SNPs per chromosome
 SP.addSnpChip(10)
-
-# Enable pedigree tracking
-SP.setTrackPed(True)
-
-print(f"SimParam: {SP.n_traits} traits, {SP.n_snp_chips} SNP chips")
-
-# Create population from founder population
 pop = new_pop(founder_pop, sim_param=SP)
-
-print(f"Population: {pop.n_ind} individuals, {pop.n_traits} traits")
-print(f"Individual IDs: {pop.id[:3]}...")
-print(f"Sexes: {pop.sex[:3]}...")
+print(pop.n_ind, pop.n_traits)
 ```
 
-### Parameters
+You can also `import AlphaSimPy` — the canonical package namespace **`alphasimpy`** re-exports the same symbols.
 
-The `run_macs()` function mirrors AlphaSimR `runMacs` semantics with Pythonic parameter names:
+## Usage overview
 
-- `n_ind`: Number of individuals to simulate
-- `n_chr`: Number of chromosomes (default: 1)
-- `seg_sites`: Number of segregating sites per chromosome (default: None for all sites)
-- `inbred`: Whether individuals are inbred (default: False)
-- `species`: Species history - "GENERIC", "CATTLE", "WHEAT", or "MAIZE" (default: "GENERIC")
-- `split`: Historic population split in generations ago (optional)
-- `ploidy`: Ploidy level (default: 2)
-- `manual_command`: Custom MaCS command (advanced users)
-- `manual_gen_len`: Custom genetic length (required with manual_command)
-- `n_threads`: Number of threads for parallel processing (default: auto-detect)
+### `run_macs`
 
-### Species Models
+Mirrors AlphaSimR `runMacs` semantics with Python-style names:
 
-- **GENERIC**: General-purpose model with reasonable population history
-- **CATTLE**: Based on Macleod et al. (2013) cattle demographic history
-- **WHEAT**: Wheat-specific demographic model
-- **MAIZE**: Maize-specific demographic model
+- **`n_ind`**, **`n_chr`**, **`seg_sites`**, **`inbred`**, **`species`** (`GENERIC`, `CATTLE`, `WHEAT`, `MAIZE`), **`split`**, **`ploidy`**, **`manual_command`** / **`manual_gen_len`**, **`n_threads`**
 
-### SimParam Class
+### Species models
 
-The `SimParam` class manages global simulation parameters:
+- **GENERIC** — default population history  
+- **CATTLE** — Macleod et al.-style demographic history  
+- **WHEAT**, **MAIZE** — crop-specific presets  
+
+### `SimParam` examples
 
 ```python
-# Create SimParam
 SP = SimParam(founder_pop)
-
-# Add traits
-SP.addTraitA(nQtlPerChr=5, mean=0, var=1)  # Additive trait
-SP.addTraitAD(nQtlPerChr=5, meanDD=0.5)     # Additive + Dominance trait
-
-# Add SNP chips
-SP.addSnpChip(nSnpPerChr=100)               # SNP chip
-
-# Set tracking options
-SP.setTrackPed(True)                        # Enable pedigree tracking
-SP.setTrackRec(True)                        # Enable recombination tracking
-SP.setSexes("yes_sys")                      # Set sex determination
-
-# Reset pedigree
-SP.resetPed(lastId=0)                       # Reset pedigree tracking
+SP.addTraitA(nQtlPerChr=5, mean=0, var=1)
+SP.addTraitAD(nQtlPerChr=5, meanDD=0.5)
+SP.addSnpChip(nSnpPerChr=100)
+SP.setTrackPed(True)
+SP.setTrackRec(True)
+SP.setSexes("yes_sys")
 ```
 
-#### SimParam Methods
+### `Pop`
 
-- `addTraitA()`: Add additive trait(s)
-- `addSnpChip()`: Add SNP chip(s)
-- `setTrackPed()`: Enable/disable pedigree tracking
-- `setTrackRec()`: Enable/disable recombination tracking
-- `setSexes()`: Set sex determination system
-- `resetPed()`: Reset pedigree tracking
+Build from founders with **`new_pop`**, **`new_empty_pop`**, **`new_multi_pop`**, etc. Main attributes include **`id`**, **`gv`**, **`pheno`**, **`ebv`**, pedigree fields, **`misc`** / **`misc_pop`**.
 
-### Pop Class
+See `src/AlphaSimPy.py` and **`alphasimpy.__all__`** for the full public API (`run_macs`, crossing, selection, `merge_pops`, `edit_genome`, …).
 
-The `Pop` class extends `MapPop` with additional population-level information:
+### `MapPop` (datasummary)
 
-```python
-# Create population from MapPop
-pop = new_pop(founder_pop, sim_param=SP)
+Population with genetic map metadata: chromosome counts, packed **`geno`**, **`gen_map`**, **`centromere`**, **ploidy**, **inbred** flag.
 
-# Access population properties
-print(f"Individuals: {pop.n_ind}")
-print(f"Traits: {pop.n_traits}")
-print(f"Individual IDs: {pop.id}")
-print(f"Sexes: {pop.sex}")
-print(f"Genetic values: {pop.gv}")
-print(f"Phenotypes: {pop.pheno}")
-print(f"Estimated breeding values: {pop.ebv}")
-```
+## Troubleshooting builds
 
-**Attributes**:
-- `id`: List of individual identifiers
-- `iid`: List of internal individual identifiers
-- `mother`: List of mother identifiers
-- `father`: List of father identifiers
-- `sex`: List of individual sexes ("M", "F", "H")
-- `n_traits`: Number of traits
-- `gv`: Matrix of genetic values (n_ind × n_traits)
-- `pheno`: Matrix of phenotypic values (n_ind × n_traits)
-- `ebv`: Matrix of estimated breeding values (n_ind × variable)
-- `gxe`: List of GxE slopes for GxE traits
-- `fix_eff`: List of fixed effects
-- `misc`: Dictionary for individual-level miscellaneous data
-- `misc_pop`: Dictionary for population-level miscellaneous data
+| Symptom | What to try |
+|---------|-------------|
+| `Boost headers not found` | Install Boost dev packages or set **`BOOST_INCLUDE_DIR`**. |
+| Armadillo not found | Install `libarmadillo-dev` (Debian) / `brew install armadillo` / set **`ARMADILLO_INCLUDE_DIR`**. |
+| Link errors for `armadillo` | Ensure the Armadillo **library** is installed, not headers only. |
+| `WARNING: C++ bindings not available` | Extension failed to load; install rebuilt with steps above or use Python fallback (slower). |
+| Wrong Python | Use `python -m pip install -e .` from the **same** interpreter you run. |
 
-## API Reference
-
-### MapPop Class
-
-The `MapPop` class represents a population with genetic map information:
-
-```python
-@dataclass
-class MapPop:
-    n_ind: int              # Number of individuals
-    n_chr: int              # Number of chromosomes
-    ploidy: int              # Ploidy level
-    n_loci: List[int]        # Number of loci per chromosome
-    geno: List[np.ndarray]   # Genotype data (packed binary format)
-    gen_map: List[np.ndarray] # Genetic map positions
-    centromere: List[float]  # Centromere positions
-    inbred: bool             # Whether individuals are inbred
-```
-
-## Technical Details
-
-This implementation:
-
-1. **Pure Python**: No external C++ dependencies or compilation required
-2. **Simplified simulation**: Replicates core MaCS functionality with Python
-3. **Maintains compatibility**: Same parameter names and behavior as AlphaSimR
-4. **Supports all features**: Manual commands, custom genetic lengths, parallel processing
-5. **Thread-safe**: Uses thread-local random number generators for parallel simulation
-
-## Dependencies
-
-- **Python Libraries**: NumPy (for numerical operations)
-- **No external C++ libraries required**
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Import error**: Make sure you're in the correct directory and have installed the dependencies
-2. **NumPy not found**: Install NumPy with `pip install numpy`
-3. **Threading issues**: The implementation uses Python threading, which should work on all platforms
+On **macOS**, OpenMP is disabled in `setup.py` for compatibility; Linux builds may use `-fopenmp` where supported.
 
 ## License
 
-This project provides a Python implementation inspired by AlphaSimR's functionality. Please refer to AlphaSimR's license for the original implementation.
+This project draws on ideas and C++ lineage from AlphaSimR; see AlphaSimR’s license for the original R package. Add or follow a `LICENSE` file in this repository for the Python port itself, if you redistribute it.
