@@ -1,6 +1,5 @@
 include README.md
 include setup.py
-include setup_alphasimpy.py
 include src/AlphaSimPy.py
 include src/alphasimpy_bindings.cpp
 graft src/alphasimpy

@@ -1,7 +1,0 @@
-^vignettes/web_only$
-^.*\.Rproj$
-^\.Rproj\.user$
-^Notes\.txt$
-^_pkgdown\.yml$
-^\.github$
-
