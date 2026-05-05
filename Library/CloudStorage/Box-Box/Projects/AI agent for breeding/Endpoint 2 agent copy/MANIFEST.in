@@ -1,6 +1,0 @@
-include README.md
-include setup.py
-include src/AlphaSimPy.py
-include src/alphasimpy_bindings.cpp
-graft src/alphasimpy
-graft src/alphasimr_cpp

@@ -1,0 +1,27 @@
+# Python build & cache
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+.Python
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# macOS / tooling
+.DS_Store
+.Rhistory
+
+# Accidental home-directory paths we never want in AlphaSimPy repo
+Library/
+jbancic_alphasimr_plants-main/
+
+# Local extension / editor
+.cursor/
+
+# Tutorials vendored elsewhere (not in this package repo)
+alphasimpy_tutorials/
