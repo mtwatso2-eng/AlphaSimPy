@@ -152,11 +152,6 @@ def add_error(gv: np.ndarray, var_e: Union[np.ndarray, List[float]], reps: int =
     return gv + error
 
 
-def addError(gv, varE=None, reps=1):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return add_error(gv, varE, reps)
-
-
 # Removed simulate_chromosome - now using C++ implementation via macs_wrapper
 
 
@@ -425,11 +420,6 @@ def new_map_pop(gen_map: List[np.ndarray], haplotypes: List[np.ndarray],
     )
 
 
-def newMapPop(genMap, haplotypes, inbred=False, ploidy=2):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return new_map_pop(genMap, haplotypes, inbred, ploidy)
-
-
 def quick_haplo(n_ind: int, n_chr: int, seg_sites: Union[int, List[int]],
                 gen_len: Union[float, List[float]] = 1, ploidy: int = 2,
                 inbred: bool = False) -> MapPop:
@@ -459,11 +449,6 @@ def quick_haplo(n_ind: int, n_chr: int, seg_sites: Union[int, List[int]],
         n_loci=seg_sites, geno=geno_list, gen_map=gen_map_list,
         centromere=centromere, inbred=inbred
     )
-
-
-def quickHaplo(nInd, nChr, segSites, genLen=1, ploidy=2, inbred=False):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return quick_haplo(nInd, nChr, segSites, genLen, ploidy, inbred)
 
 
 def import_gen_map(gen_map) -> tuple:
@@ -546,11 +531,6 @@ def import_haplo(haplo, gen_map, ploidy: int = 2, ped=None) -> MapPop:
     return founder
 
 
-def importHaplo(haplo, genMap, ploidy=2, ped=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return import_haplo(haplo, genMap, ploidy, ped)
-
-
 def edit_genome(pop, ind, chr, seg_sites, allele, sim_param=None) -> 'Pop':
     """
     Edit genome at specific locus. From AlphaSimR misc.R editGenome.
@@ -596,11 +576,6 @@ def edit_genome(pop, ind, chr, seg_sites, allele, sim_param=None) -> 'Pop':
     return pop
 
 
-def editGenome(pop, ind, chr, segSites, allele, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return edit_genome(pop, ind, chr, segSites, allele, simParam)
-
-
 def new_empty_pop(ploidy: int = 2, sim_param=None) -> 'Pop':
     """Create empty population. From AlphaSimR Class-Pop.R newEmptyPop."""
     if sim_param is None:
@@ -620,11 +595,6 @@ def new_empty_pop(ploidy: int = 2, sim_param=None) -> 'Pop':
         ebv=np.empty((0, 0)), gxe=[None] * sim_param.n_traits,
         fix_eff=[], misc={}, misc_pop={}
     )
-
-
-def newEmptyPop(ploidy=2, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return new_empty_pop(ploidy, simParam)
 
 
 @dataclass
@@ -654,11 +624,6 @@ def new_multi_pop(*pops) -> MultiPop:
         else:
             flat.append(p)
     return MultiPop(pops=flat)
-
-
-def newMultiPop(*pops):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return new_multi_pop(*pops)
 
 
 def _pull_geno_from_packed(geno_list: List[np.ndarray], n_loci: List[int],
@@ -701,31 +666,6 @@ def pull_seg_site_geno(pop, chr=None, as_raw: bool = False,
     loci_per_chr = [np.arange(n) for n in n_loci]
     result = _pull_geno_from_packed(geno, n_loci, ploidy, loci_per_chr)
     return result
-
-
-def pullSegSiteGeno(pop, chr=None, asRaw=False, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return pull_seg_site_geno(pop, chr, asRaw, simParam)
-
-
-# Convenience function with the same name as AlphaSimR
-def runMacs(nInd, nChr=1, segSites=None, inbred=False, species="GENERIC",
-            split=None, ploidy=2, manualCommand=None, manualGenLen=None, nThreads=None):
-    """
-    Convenience function with AlphaSimR-style parameter names
-    """
-    return run_macs(
-        n_ind=nInd,
-        n_chr=nChr,
-        seg_sites=segSites,
-        inbred=inbred,
-        species=species,
-        split=split,
-        ploidy=ploidy,
-        manual_command=manualCommand,
-        manual_gen_len=manualGenLen,
-        n_threads=nThreads
-    )
 
 
 # Trait classes
@@ -1756,11 +1696,6 @@ def merge_pops(pop_list) -> Pop:
     )
 
 
-def mergePops(popList):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return merge_pops(popList)
-
-
 def new_pop(raw_pop: MapPop, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
     """
     Create new population from MapPop
@@ -1955,16 +1890,6 @@ def _get_gv_index(raw_pop: MapPop, sim_param: SimParam) -> np.ndarray:
     return gv
 
 
-# Convenience function with AlphaSimR-style name
-def newPop(raw_pop: MapPop, simParam: Optional[SimParam] = None, **kwargs) -> Pop:
-    """
-    Convenience function with AlphaSimR-style parameter names
-    """
-    if "sim_param" in kwargs:
-        raise TypeError("newPop() only accepts AlphaSimR-style argument 'simParam'")
-    return new_pop(raw_pop, simParam, **kwargs)
-
-
 # Genetic statistics functions
 def mean_g(pop: Pop) -> np.ndarray:
     """
@@ -2015,22 +1940,6 @@ def mean_p(pop: Pop) -> np.ndarray:
         Mean phenotypic values for each trait
     """
     return np.mean(pop.pheno, axis=0)
-
-
-# Convenience functions with AlphaSimR-style names
-def meanG(pop: Pop) -> np.ndarray:
-    """Convenience function with AlphaSimR-style name"""
-    return mean_g(pop)
-
-
-def varG(pop: Pop) -> np.ndarray:
-    """Convenience function with AlphaSimR-style name"""
-    return var_g(pop)
-
-
-def meanP(pop: Pop) -> np.ndarray:
-    """Convenience function with AlphaSimR-style name"""
-    return mean_p(pop)
 
 
 # Phenotype functions
@@ -2087,12 +1996,6 @@ def set_pheno(pop: Pop, var_e: Optional[Union[float, List[float], np.ndarray]] =
     # Update population
     pop.pheno = pheno
     return pop
-
-
-def setPheno(pop: Pop, varE: Optional[Union[float, List[float], np.ndarray]] = None,
-             reps: int = 1, simParam: Optional[SimParam] = None) -> Pop:
-    """Convenience function with AlphaSimR-style parameter names"""
-    return set_pheno(pop, varE, reps, simParam)
 
 
 def _cut_r_style(x: np.ndarray, breaks: np.ndarray, include_lowest: bool, right: bool) -> np.ndarray:
@@ -2203,16 +2106,12 @@ def as_categorical(x: np.ndarray, p: Optional[Union[float, np.ndarray, List]] = 
     return result
 
 
-def asCategorical(x, p=None, mean=0, var=1, threshold=None, includeLowest=True, right=False):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return as_categorical(x, p, mean, var, threshold, includeLowest, right)
-
-
 # Selection functions
 def select_ind(pop: Pop, n_ind: int, trait: Union[int, callable] = 1,
                use: Union[str, callable] = "pheno", sex: str = "B",
                select_top: bool = True, return_pop: bool = True,
                candidates: Optional[List[int]] = None,
+               parents: Optional[List[int]] = None,
                sim_param: Optional[SimParam] = None, **kwargs) -> Union[Pop, List[int]]:
     """
     Select a subset of individuals from a population
@@ -2247,7 +2146,10 @@ def select_ind(pop: Pop, n_ind: int, trait: Union[int, callable] = 1,
     """
     if sim_param is None:
         raise ValueError("simParam must be provided")
-    
+
+    if candidates is None and parents is not None:
+        candidates = parents
+
     if n_ind <= 0:
         if return_pop:
             # Return empty population
@@ -2339,17 +2241,6 @@ def select_ind(pop: Pop, n_ind: int, trait: Union[int, callable] = 1,
         )
     else:
         return selected_eligible
-
-
-def selectInd(pop: Pop, nInd: int, trait: Union[int, callable] = 1,
-              use: str = "pheno", sex: str = "B", selectTop: bool = True,
-              returnPop: bool = True, candidates: Optional[List[int]] = None,
-              simParam: Optional[SimParam] = None, sim_param: Optional[SimParam] = None, **kwargs) -> Union[Pop, List[int]]:
-    """Convenience function with AlphaSimR-style parameter names"""
-    sp = simParam or sim_param
-    st = kwargs.get("select_top", kwargs.get("selectTop", selectTop))
-    kwargs_clean = {k: v for k, v in kwargs.items() if k not in ("select_top", "selectTop")}
-    return select_ind(pop, nInd, trait, use, sex, st, returnPop, candidates, sp, **kwargs_clean)
 
 
 # Crossing functions
@@ -2474,13 +2365,6 @@ def rand_cross(pop: Pop, n_crosses: int, n_progeny: int = 1,
     return progeny_pop
 
 
-def randCross(pop: Pop, nCrosses: int = None, nProgeny: int = 1, balance: bool = True,
-              parents: Optional[List[int]] = None, ignoreSexes: bool = False,
-              simParam: Optional[SimParam] = None, **kwargs) -> Pop:
-    """Convenience function with AlphaSimR-style parameter names"""
-    return rand_cross(pop, nCrosses, nProgeny, balance, parents, ignoreSexes, simParam)
-
-
 def _do_crosses(females: Pop, males: Pop, cross_plan: np.ndarray, n_progeny: int,
                  sim_param: SimParam) -> Pop:
     """Execute crosses from cross plan. Returns progeny Pop."""
@@ -2554,11 +2438,6 @@ def make_cross(pop: Pop, cross_plan: np.ndarray, n_progeny: int = 1,
     return _do_crosses(pop, pop, cross_plan, 1, sim_param)
 
 
-def makeCross(pop, crossPlan=None, nProgeny=1, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return make_cross(pop, crossPlan, nProgeny, simParam)
-
-
 def make_cross2(females: Pop, males: Pop, cross_plan: np.ndarray, n_progeny: int = 1,
                 sim_param: Optional[SimParam] = None) -> Pop:
     """Make crosses between two populations. From AlphaSimR crossing.R makeCross2."""
@@ -2594,11 +2473,6 @@ def make_cross2(females: Pop, males: Pop, cross_plan: np.ndarray, n_progeny: int
     return _do_crosses(females, males, cross_plan, 1, sim_param)
 
 
-def makeCross2(females, males, crossPlan=None, nProgeny=1, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return make_cross2(females, males, crossPlan, nProgeny, simParam)
-
-
 def rand_cross2(females: Pop, males: Pop, n_crosses: int, n_progeny: int = 1,
                 balance: bool = True, female_parents=None, male_parents=None,
                 ignore_sexes: bool = False, sim_param: Optional[SimParam] = None) -> Pop:
@@ -2629,13 +2503,6 @@ def rand_cross2(females: Pop, males: Pop, n_crosses: int, n_progeny: int = 1,
     return _do_crosses(females, males, cross_plan, n_progeny, sim_param)
 
 
-def randCross2(females, males, nCrosses=None, nProgeny=1, balance=True,
-               femaleParents=None, maleParents=None, ignoreSexes=False, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return rand_cross2(females, males, nCrosses, nProgeny, balance,
-                       femaleParents, maleParents, ignoreSexes, simParam)
-
-
 def self_(pop: Pop, n_progeny: int = 1, parents=None, keep_parents: bool = True,
           sim_param: Optional[SimParam] = None) -> Pop:
     """Self individuals. From AlphaSimR crossing.R self."""
@@ -2646,11 +2513,6 @@ def self_(pop: Pop, n_progeny: int = 1, parents=None, keep_parents: bool = True,
     cross_plan = np.column_stack([np.repeat(parents, n_progeny),
                                   np.repeat(parents, n_progeny)])
     return _do_crosses(pop, pop, cross_plan, 1, sim_param)
-
-
-def self(pop, nProgeny=1, parents=None, keepParents=True, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names (self is Python keyword)"""
-    return self_(pop, nProgeny, parents, keepParents, simParam)
 
 
 def make_dh(pop: Pop, n_dh: int = 1, use_female: bool = True, keep_parents: bool = True,
@@ -2693,11 +2555,6 @@ def make_dh(pop: Pop, n_dh: int = 1, use_female: bool = True, keep_parents: bool
     return progeny_pop
 
 
-def makeDH(pop, nDH=1, useFemale=True, keepParents=True, simParam=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return make_dh(pop, nDH, useFemale, keepParents, simParam)
-
-
 def select_cross(pop: Pop, n_ind=None, n_female=None, n_male=None, n_crosses: int = 1,
                 n_progeny: int = 1, trait=1, use: str = "pheno", select_top: bool = True,
                 balance: bool = True, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
@@ -2720,20 +2577,24 @@ def select_cross(pop: Pop, n_ind=None, n_female=None, n_male=None, n_crosses: in
         return rand_cross2(females, males, n_crosses, n_progeny, balance, sim_param=sim_param)
 
 
-def selectCross(pop, nInd=None, nFemale=None, nMale=None, nCrosses=1, nProgeny=1,
-                trait=1, use="pheno", selectTop=True, balance=True, simParam=None, **kwargs):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return select_cross(pop, nInd, nFemale, nMale, nCrosses, nProgeny,
-                        trait, use, selectTop, balance, simParam, **kwargs)
-
-
 def select_op(pop: Pop, n_ind: int, n_seeds: int, prob_self: float = 0,
               pollen_control: bool = False, trait=1, use: str = "pheno",
               select_top: bool = True, candidates=None, sim_param: Optional[SimParam] = None, **kwargs) -> Pop:
     """Open pollination. From AlphaSimR selection.R selectOP."""
     if sim_param is None:
         raise ValueError("simParam must be provided")
-    female = select_ind(pop, n_ind, trait, use, "B", select_top, False, candidates, sim_param, **kwargs)
+    female = select_ind(
+        pop,
+        n_ind,
+        trait,
+        use,
+        "B",
+        select_top,
+        False,
+        candidates=candidates,
+        sim_param=sim_param,
+        **kwargs,
+    )
     n_self = np.random.binomial(n_seeds, prob_self, n_ind)
     cross_plan = []
     for i, f in enumerate(female):
@@ -2752,13 +2613,6 @@ def select_op(pop: Pop, n_ind: int, n_seeds: int, prob_self: float = 0,
     return make_cross(pop, cross_plan, 1, sim_param)
 
 
-def selectOP(pop, nInd=None, nSeeds=None, probSelf=0, pollenControl=False, trait=1,
-            use="pheno", selectTop=True, candidates=None, simParam=None, **kwargs):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return select_op(pop, nInd, nSeeds, probSelf, pollenControl, trait, use,
-                     selectTop, candidates, simParam, **kwargs)
-
-
 def hybrid_cross(females: Pop, males: Pop, cross_plan: str = "testcross",
                  return_hybrid_pop: bool = False,
                  sim_param: Optional[SimParam] = None) -> Pop:
@@ -2773,13 +2627,6 @@ def hybrid_cross(females: Pop, males: Pop, cross_plan: str = "testcross",
         if np.min(cross_plan) >= 1:
             cross_plan = cross_plan + 1
     return make_cross2(females, males, cross_plan, 1, sim_param)
-
-
-def hybridCross(females, males, crossPlan="testcross", returnHybridPop=False, simParam=None,
-                return_hybrid_pop=None):
-    """Convenience function with AlphaSimR-style parameter names"""
-    rhp = returnHybridPop if return_hybrid_pop is None else return_hybrid_pop
-    return hybrid_cross(females, males, crossPlan, rhp, simParam)
 
 
 def calc_gca(pop: Pop, use: str = "pheno") -> dict:
@@ -2823,16 +2670,12 @@ def calc_gca(pop: Pop, use: str = "pheno") -> dict:
     return {'GCAf': GCAf, 'GCAm': GCAm, 'SCA': SCA}
 
 
-def calcGCA(pop, use="pheno"):
-    """Convenience function with AlphaSimR-style parameter names"""
-    return calc_gca(pop, use)
-
-
-# Public API intentionally exports AlphaSimR-style names.
+# Public API: snake_case module functions; SimParam methods keep AlphaSimR-style names.
 __all__ = [
     "MapPop", "TraitA", "TraitAD", "TraitAE", "TraitAG", "SimParam", "Pop", "MultiPop",
-    "runMacs", "quickHaplo", "newMapPop", "importHaplo", "newPop", "newEmptyPop", "newMultiPop",
-    "pullSegSiteGeno", "addError", "setPheno", "meanG", "varG", "meanP",
-    "selectInd", "randCross", "makeCross", "makeCross2", "randCross2", "self", "makeDH",
-    "selectCross", "selectOP", "hybridCross", "calcGCA", "asCategorical",
+    "run_macs", "quick_haplo", "new_map_pop", "import_haplo", "new_pop", "new_empty_pop", "new_multi_pop",
+    "pull_seg_site_geno", "add_error", "set_pheno", "mean_g", "var_g", "mean_p",
+    "select_ind", "rand_cross", "make_cross", "make_cross2", "rand_cross2", "self_", "make_dh",
+    "select_cross", "select_op", "hybrid_cross", "calc_gca", "as_categorical",
+    "merge_pops", "edit_genome", "import_gen_map", "get_num_threads", "sample_int",
 ]
