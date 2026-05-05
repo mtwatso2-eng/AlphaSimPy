@@ -18,7 +18,7 @@
      - Translate program/genome/founders/populations/workflow/control/resources/outputs into coherent AlphaSimPy simulation code.
      - Preserve stage progression, population sizes, crossing/selection operations, and evaluation logic.
      - Use explicit assumptions only when BRAID data is missing; state assumptions in markdown cells.
-     - Use only AlphaSimR-style AlphaSimPy API names (camelCase), for example: `runMacs`, `newPop(..., simParam=SP)`, `setPheno(..., varE=...)`, `randCross`, `selectInd`, `meanG`, `varG`.
+     - Use the public AlphaSimPy Python API with snake_case functions, for example: `run_macs`, `new_pop(..., sim_param=SP)`, `set_pheno(..., var_e=...)`, `rand_cross`, `select_ind`, `mean_g`, `var_g`. SimParam retains some AlphaSimR-style method aliases (for example `addTraitA`).
   4. **Build notebook cells**:
      - Construct a list of markdown and code cells (tutorial style, readable section headings).
      - Prefer deterministic, runnable code and clear variable names.

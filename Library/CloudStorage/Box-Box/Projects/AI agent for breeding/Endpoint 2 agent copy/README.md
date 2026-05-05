@@ -41,11 +41,11 @@ jupyter notebook AlphaSimPy.ipynb
 
 ### Basic Usage
 ```python
-from AlphaSimPy import runMacs, MapPop, SimParam
+from AlphaSimPy import run_macs, MapPop, SimParam
 
 # Create a population of 10 outbred individuals
 # with 1 chromosome and 100 segregating sites
-founder_pop = runMacs(nInd=10, nChr=1, segSites=100)
+founder_pop = run_macs(n_ind=10, n_chr=1, seg_sites=100)
 
 print(f"Number of individuals: {founder_pop.n_ind}")
 print(f"Number of chromosomes: {founder_pop.n_chr}")
@@ -68,7 +68,7 @@ SP.setTrackPed(True)
 print(f"SimParam: {SP.n_traits} traits, {SP.n_snp_chips} SNP chips")
 
 # Create population from founder population
-pop = newPop(founder_pop, sim_param=SP)
+pop = new_pop(founder_pop, sim_param=SP)
 
 print(f"Population: {pop.n_ind} individuals, {pop.n_traits} traits")
 print(f"Individual IDs: {pop.id[:3]}...")
@@ -77,18 +77,18 @@ print(f"Sexes: {pop.sex[:3]}...")
 
 ### Parameters
 
-The `runMacs()` function accepts the same parameters as AlphaSimR:
+The `run_macs()` function mirrors AlphaSimR `runMacs` semantics with Pythonic parameter names:
 
-- `nInd`: Number of individuals to simulate
-- `nChr`: Number of chromosomes (default: 1)
-- `segSites`: Number of segregating sites per chromosome (default: None for all sites)
+- `n_ind`: Number of individuals to simulate
+- `n_chr`: Number of chromosomes (default: 1)
+- `seg_sites`: Number of segregating sites per chromosome (default: None for all sites)
 - `inbred`: Whether individuals are inbred (default: False)
 - `species`: Species history - "GENERIC", "CATTLE", "WHEAT", or "MAIZE" (default: "GENERIC")
 - `split`: Historic population split in generations ago (optional)
 - `ploidy`: Ploidy level (default: 2)
-- `manualCommand`: Custom MaCS command (advanced users)
-- `manualGenLen`: Custom genetic length (required with manualCommand)
-- `nThreads`: Number of threads for parallel processing (default: auto-detect)
+- `manual_command`: Custom MaCS command (advanced users)
+- `manual_gen_len`: Custom genetic length (required with manual_command)
+- `n_threads`: Number of threads for parallel processing (default: auto-detect)
 
 ### Species Models
 
@@ -136,7 +136,7 @@ The `Pop` class extends `MapPop` with additional population-level information:
 
 ```python
 # Create population from MapPop
-pop = newPop(founder_pop, sim_param=SP)
+pop = new_pop(founder_pop, sim_param=SP)
 
 # Access population properties
 print(f"Individuals: {pop.n_ind}")
