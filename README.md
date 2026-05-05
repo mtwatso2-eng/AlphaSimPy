@@ -132,7 +132,7 @@ Build from founders with **`new_pop`**, **`new_empty_pop`**, **`new_multi_pop`**
 
 See `src/AlphaSimPy.py` and **`alphasimpy.__all__`** for the full public API (`run_macs`, crossing, selection, `merge_pops`, `edit_genome`, …).
 
-### `MapPop` (datasummary)
+### `MapPop` (data summary)
 
 Population with genetic map metadata: chromosome counts, packed **`geno`**, **`gen_map`**, **`centromere`**, **ploidy**, **inbred** flag.
 
