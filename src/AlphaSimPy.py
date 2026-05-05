@@ -3,29 +3,26 @@ import random
 import importlib
 from typing import Optional, List, Union, Dict, Any
 from dataclasses import dataclass
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
-import threading
 
-# Try to import C++ bindings, fall back to Python implementation if not available
-try:
+_CPP_IMPORT_ERROR = (
+    "The alphasimpy C++ extension (alphasimpy._alphasimpy_cpp) is required. "
+    "Install with a C++14 toolchain plus Boost and Armadillo, then run "
+    "`pip install -e .` from the repository root (see README). "
+    "If the package is already installed, rebuild with `pip install -e . --no-build-isolation --force-reinstall`."
+)
+
+
+def _load_cpp_extension():
     try:
-        import _alphasimpy_cpp
-    except ImportError:
-        # Package-style extension location
-        _alphasimpy_cpp = importlib.import_module("alphasimpy._alphasimpy_cpp")
-    _USE_CPP = True
-except ImportError:
-    _USE_CPP = False
-    print("Warning: C++ bindings not available. Using Python implementation.")
-    # Thread-local random number generator
-    _thread_local = threading.local()
+        try:
+            return importlib.import_module("_alphasimpy_cpp")
+        except ImportError:
+            return importlib.import_module("alphasimpy._alphasimpy_cpp")
+    except ImportError as exc:
+        raise ImportError(_CPP_IMPORT_ERROR) from exc
 
-    def get_thread_local_random():
-        """Get thread-local random number generator"""
-        if not hasattr(_thread_local, 'rng'):
-            _thread_local.rng = random.Random()
-        return _thread_local.rng
+
+_alphasimpy_cpp = _load_cpp_extension()
 
 
 @dataclass
@@ -65,24 +62,13 @@ class MapPop:
 
 
 def get_num_threads() -> int:
-    """Get the number of available threads"""
-    if _USE_CPP:
-        return _alphasimpy_cpp.get_num_threads()
-    return mp.cpu_count()
+    """Get the number of available threads."""
+    return _alphasimpy_cpp.get_num_threads()
 
 
 def sample_int(n: int, N: int) -> np.ndarray:
-    """Sample n integers without replacement from 0 to N-1"""
-    if _USE_CPP:
-        return _alphasimpy_cpp.sample_int(n, N)
-    
-    if n == 0:
-        return np.array([], dtype=np.uint32)
-    if n >= N:
-        return np.arange(N, dtype=np.uint32)
-    
-    # Use numpy's random choice for efficiency
-    return np.random.choice(N, size=n, replace=False).astype(np.uint32)
+    """Sample n integers without replacement from 0 to N-1."""
+    return _alphasimpy_cpp.sample_int(n, N)
 
 
 def _trans_mat(R: np.ndarray) -> np.ndarray:
@@ -292,27 +278,21 @@ def run_macs(n_ind: int,
     else:
         gen_len = [float(x) for x in gen_len]
     
-    # Simulate chromosomes using C++ implementation
-    if _USE_CPP:
-        # Convert seg_sites to numpy array
-        max_sites_array = np.array(seg_sites, dtype=np.uint32)
-        
-        # Call C++ MaCS function
-        result = _alphasimpy_cpp.macs(
-            command,
-            max_sites_array,
-            inbred,
-            ploidy,
-            n_threads,
-            seed
-        )
-        
-        geno_list = result['geno']
-        gen_map_list = result['gen_map']
-        n_loci_list = [len(gm) for gm in gen_map_list]
-    else:
-        # Fallback to Python implementation (removed - would need to be reimplemented)
-        raise RuntimeError("C++ bindings required. Please build the extension module.")
+    # Simulate chromosomes using C++ MaCS implementation
+    max_sites_array = np.array(seg_sites, dtype=np.uint32)
+
+    result = _alphasimpy_cpp.macs(
+        command,
+        max_sites_array,
+        inbred,
+        ploidy,
+        n_threads,
+        seed
+    )
+
+    geno_list = result['geno']
+    gen_map_list = result['gen_map']
+    n_loci_list = [len(gm) for gm in gen_map_list]
     
     # Check if desired number of loci were obtained
     is_limited = [sites > 0 for sites in seg_sites]

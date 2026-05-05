@@ -133,8 +133,8 @@ else:
 
 setup(
     name="alphasimpy",
-    version="0.2.0",
-    description="AlphaSimPy with standalone C++ bindings for MaCS simulation",
+    version="0.3.0",
+    description="AlphaSimPy: breeding simulation with required C++/pybind11 extension",
     packages=["alphasimpy"],
     package_dir={"": "src"},
     py_modules=["AlphaSimPy"],

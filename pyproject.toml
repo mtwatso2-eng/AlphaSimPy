@@ -9,8 +9,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alphasimpy"
-version = "0.2.0"
-description = "AlphaSimPy with standalone C++ bindings for MaCS simulation"
+version = "0.3.0"
+description = "AlphaSimPy: AlphaSimR-aligned breeding simulation (required C++/pybind11 extension)"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

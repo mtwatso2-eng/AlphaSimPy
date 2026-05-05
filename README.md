@@ -1,16 +1,18 @@
 # AlphaSimPy
 
-Python breeding simulation aligned with [AlphaSimR](https://github.com/gaynorr/AlphaSimR). The package builds an optional **C++ extension** (pybind11 + AlphaSimR-derived sources under `src/alphasimr_cpp/`) for faster coalescent-style founder generation and related paths. If the extension is missing, many routines **fall back to pure Python** (you will see a one-time import warning).
+Python breeding simulation aligned with [AlphaSimR](https://github.com/gaynorr/AlphaSimR). A **compiled C++ extension** is **required**: pybind11 + AlphaSimR-derived sources under `src/alphasimr_cpp/` provide MaCS-style founder simulation and primitives such as **`run_macs`**, **`get_num_threads`**, and **`sample_int`**. There is **no** offline or pure-Python substitute; `import alphasimpy` fails until the extension is built and loadable.
 
 ## Requirements
 
 | | |
 |---|---|
 | **Python** | 3.9+ (see `pyproject.toml`) |
-| **Runtime** | `numpy`, `pybind11` |
-| **Build (extension)** | C++14-capable toolchain, **Boost headers**, **Armadillo** (headers + linked library) |
+| **Runtime** | `numpy`, `pybind11`, **native extension** `_alphasimpy_cpp` (installed as `alphasimpy._alphasimpy_cpp`) |
+| **Build from source** | C++14-capable toolchain, **Boost headers**, **Armadillo** (headers + linked library). Required whenever you install from an sdist or develop from a git checkout without matching wheels. |
 
 Bundled C++ sources live in `src/alphasimr_cpp/`. You do **not** need a separate AlphaSimR checkout unless you override the source path (see below).
+
+**Prefer installing from published wheels when they exist for your OS and Python** (`pip install alphasimpy`); wheels bundle the compiled extension so you skip local C++ tooling. Working from git still requires building the extension once.
 
 ## Quick install (from a clone)
 
@@ -53,10 +55,10 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -U pip setuptools wheel
 
-# editable install while developing (builds extension in-place)
+# editable install (always builds/links the extension)
 pip install -e .
 
-# optional: notebooks, plotting, etc.
+# optional extras: notebooks, plotting, …
 pip install -r requirements.txt
 ```
 
@@ -98,7 +100,7 @@ pop = new_pop(founder_pop, sim_param=SP)
 print(pop.n_ind, pop.n_traits)
 ```
 
-You can also `import AlphaSimPy` — the canonical package namespace **`alphasimpy`** re-exports the same symbols.
+You can also `import AlphaSimPy` — **`alphasimpy`** re-exports the same symbols. Either import triggers loading of **`alphasimpy._alphasimpy_cpp`**.
 
 ## Usage overview
 
@@ -140,11 +142,11 @@ Population with genetic map metadata: chromosome counts, packed **`geno`**, **`g
 
 | Symptom | What to try |
 |---------|-------------|
+| `ImportError: The alphasimpy C++ extension …` | Rebuild/install on this interpreter: **`pip install -e .`** or reinstall the wheel from PyPI / CI artifacts; confirm Boost + Armadillo are present before building from source. |
 | `Boost headers not found` | Install Boost dev packages or set **`BOOST_INCLUDE_DIR`**. |
 | Armadillo not found | Install `libarmadillo-dev` (Debian) / `brew install armadillo` / set **`ARMADILLO_INCLUDE_DIR`**. |
 | Link errors for `armadillo` | Ensure the Armadillo **library** is installed, not headers only. |
-| `WARNING: C++ bindings not available` | Extension failed to load; install rebuilt with steps above or use Python fallback (slower). |
-| Wrong Python | Use `python -m pip install -e .` from the **same** interpreter you run. |
+| Wrong Python | Use **`python -m pip install .`** so build and runtime use the **same** interpreter. |
 
 On **macOS**, OpenMP is disabled in `setup.py` for compatibility; Linux builds may use `-fopenmp` where supported.
 
